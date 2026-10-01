@@ -1,0 +1,6 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+
+# Generated Sleeper snapshots and player cache
+/snapshots/
