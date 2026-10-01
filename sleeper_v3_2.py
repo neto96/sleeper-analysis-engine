@@ -538,17 +538,8 @@ def classify_position_need(
         "meaningful_difference":
             meaningful_difference
     }
-def calculate_optimal_lineup(
-    positions
-    ):
-
-    requirements = {
-    
-        "QB": 1,
-        "RB": 2,
-        "WR": 2,
-        "TE": 1
-    }
+def calculate_optimal_lineup(positions, roster_configuration):
+    supported_positions = ["QB", "RB", "WR", "TE"]
 
     tier_score = {
         "elite": 5,
@@ -560,87 +551,19 @@ def calculate_optimal_lineup(
     }
 
     def player_score(player):
-
-        if player.get(
-            "status"
-        ) == "Inactive":
-
+        if player.get("status") == "Inactive":
             return -1
 
-        if player.get(
-            "injury_status"
-        ) == "IR":
-
+        if player.get("injury_status") == "IR":
             return -1
 
         return (
             tier_score.get(
-                player.get(
-                    "fantasy_value_tier"
-                ),
+                player.get("fantasy_value_tier"),
                 0
             ) * 100
-            + player.get(
-                "importance_score",
-                0
-            )
+            + player.get("importance_score", 0)
         )
-
-    rb = [
-        player
-        for player in positions.get(
-            "RB",
-            []
-        )
-        if player_score(player) >= 0
-    ]
-
-    wr = [
-        player
-        for player in positions.get(
-            "WR",
-            []
-        )
-        if player_score(player) >= 0
-    ]
-
-    te = [
-        player
-        for player in positions.get(
-            "TE",
-            []
-        )
-        if player_score(player) >= 0
-    ]
-
-    rb.sort(
-        key=player_score,
-        reverse=True
-    )
-
-    wr.sort(
-        key=player_score,
-        reverse=True
-    )
-
-    te.sort(
-        key=player_score,
-        reverse=True
-    )
-
-    qb = [
-        player
-        for player in positions.get(
-            "QB",
-            []
-        )
-        if player_score(player) >= 0
-    ]
-
-    qb.sort(
-        key=player_score,
-        reverse=True
-    )
 
     best_lineup = {
         "QB": [],
@@ -649,101 +572,182 @@ def calculate_optimal_lineup(
         "TE": [],
         "FLEX": []
     }
+    slots = []
+    direct_slots = roster_configuration.get("direct_slots", {})
 
-    for player in qb[:1]:
-        player = player.copy()
-        player["position"] = "QB"
-        best_lineup["QB"].append(player)
+    for position in supported_positions:
+        count = max(0, int(direct_slots.get(position, 0)))
+        for _ in range(count):
+            slots.append({
+                "lineup_position": position,
+                "eligible_positions": [position],
+                "is_flex": False,
+            })
 
-    for player in rb[:2]:
-        player = player.copy()
-        player["position"] = "RB"
-        best_lineup["RB"].append(player)
-
-    for player in wr[:2]:
-        player = player.copy()
-        player["position"] = "WR"
-        best_lineup["WR"].append(player)
-
-    for player in te[:1]:
-        player = player.copy()
-        player["position"] = "TE"
-        best_lineup["TE"].append(player)
-
-    used_ids = set()
-
-    for position in [
-        "RB",
-        "WR",
-        "TE"
-    ]:
-
-        for player in best_lineup[position]:
-
-            used_ids.add(
-                player.get(
-                    "player_id"
-                )
-            )
-
-    flex_candidates = []
-
-    for position in [
-        "RB",
-        "WR",
-        "TE"
-    ]:
-        for player in positions.get(
-            position,
-            []
-        ):
-
-            player = player.copy()
-            player["position"] = position
-
-            player_id = player.get(
-                "player_id"
-            )
-
-            if player_id in used_ids:
-                continue
-
-            if player_score(player) < 0:
-                continue
-
-            flex_candidates.append(
-                player
-            )
-
-    # FLEX tie-breaker:
-    # When players have the same fantasy score,
-    # prefer WR over RB over TE. This prevents an
-    # equivalent RB from unnecessarily displacing
-    # an equivalent WR from the FLEX.
-    flex_position_priority = {
-        "WR": 0,
-        "RB": 1,
-        "TE": 2
-    }
-
-    flex_candidates.sort(
-        key=lambda player: (
-            -player_score(player),
-            flex_position_priority.get(
-                player.get("position"),
-                99
-            )
-        )
-    )
-
-    if flex_candidates:
-
-        best_lineup["FLEX"] = [
-            flex_candidates[0]
+    flex_slots = roster_configuration.get("flex_slots", {})
+    for slot_code in sorted(flex_slots):
+        slot_data = flex_slots[slot_code]
+        count = max(0, int(slot_data.get("count", 0)))
+        eligible_positions = [
+            position
+            for position in slot_data.get("eligible_positions", [])
+            if position in supported_positions
         ]
 
+        if not count or not eligible_positions:
+            continue
+
+        best_lineup.setdefault(slot_code, [])
+        for _ in range(count):
+            slots.append({
+                "lineup_position": slot_code,
+                "eligible_positions": eligible_positions,
+                "is_flex": True,
+            })
+
+    candidates = []
+    seen_player_ids = set()
+
+    for position in supported_positions:
+        for player in positions.get(position, []):
+            player_id = player.get("player_id")
+            if player_id is None:
+                continue
+
+            # build_fantasy_analysis stores string IDs and keeps position in
+            # the containing group; preserve those V3.2 data-model semantics.
+            player_key = player_id
+            if player_key in seen_player_ids:
+                continue
+
+            # V3.2 annotated candidates from the position-group key.
+            actual_position = position
+            if actual_position not in supported_positions:
+                continue
+
+            score = player_score(player)
+            if score < 0:
+                continue
+
+            seen_player_ids.add(player_key)
+            candidate = player.copy()
+            candidate["position"] = actual_position
+            candidates.append({
+                "player_id": player_key,
+                "position": actual_position,
+                "score": score,
+                "order": len(candidates),
+                "player": candidate,
+            })
+
+    candidates_by_slot = []
+    legacy_flex_priority = {"WR": 0, "RB": 1, "TE": 2}
+
+    for slot in slots:
+        eligible_positions = slot["eligible_positions"]
+        if slot["is_flex"] and slot["lineup_position"] == "FLEX":
+            position_priority = legacy_flex_priority
+        else:
+            position_priority = {
+                position: index
+                for index, position in enumerate(eligible_positions)
+            }
+
+        eligible_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["position"] in eligible_positions
+        ]
+        eligible_candidates.sort(
+            key=lambda candidate: (
+                -candidate["score"],
+                position_priority.get(candidate["position"], 99),
+                candidate["order"],
+            )
+        )
+        candidates_by_slot.append(eligible_candidates)
+
+    best_score = -1
+    best_filled_slots = -1
+    best_assignment = None
+
+    # This exact search is intentionally sized for current fantasy rosters;
+    # its worst-case complexity is exponential in the number of slots.
+    def search(slot_index, total_score, used_player_ids, assignment, filled_slots):
+        nonlocal best_score, best_filled_slots, best_assignment
+
+        if slot_index == len(slots):
+            if (
+                total_score > best_score
+                or (
+                    total_score == best_score
+                    and filled_slots > best_filled_slots
+                )
+            ):
+                best_score = total_score
+                best_filled_slots = filled_slots
+                best_assignment = assignment.copy()
+            return
+
+        upper_score = total_score
+        upper_filled_slots = filled_slots
+        for remaining_candidates in candidates_by_slot[slot_index:]:
+            available_scores = [
+                candidate["score"]
+                for candidate in remaining_candidates
+                if candidate["player_id"] not in used_player_ids
+            ]
+            if available_scores:
+                upper_score += max(available_scores)
+                upper_filled_slots += 1
+
+        if best_assignment is not None and (
+            upper_score < best_score
+            or (
+                upper_score == best_score
+                and upper_filled_slots <= best_filled_slots
+            )
+        ):
+            return
+
+        for candidate in candidates_by_slot[slot_index]:
+            player_id = candidate["player_id"]
+            if player_id in used_player_ids:
+                continue
+
+            used_player_ids.add(player_id)
+            assignment.append(candidate)
+            search(
+                slot_index + 1,
+                total_score + candidate["score"],
+                used_player_ids,
+                assignment,
+                filled_slots + 1,
+            )
+            assignment.pop()
+            used_player_ids.remove(player_id)
+
+        assignment.append(None)
+        search(
+            slot_index + 1,
+            total_score,
+            used_player_ids,
+            assignment,
+            filled_slots,
+        )
+        assignment.pop()
+
+    search(0, 0, set(), [], 0)
+
+    if best_assignment is not None:
+        for slot, candidate in zip(slots, best_assignment):
+            if candidate is not None:
+                best_lineup[slot["lineup_position"]].append(
+                    candidate["player"].copy()
+                )
+
     return best_lineup
-    
+
 def classify_starting_depth(
     position,
     team_summary,
@@ -1195,7 +1199,8 @@ def calculate_roster_surplus(
 
     return surplus
 def calculate_roster_replacement_cost(
-    team
+    team,
+    roster_configuration
     ):
     replacement_cost = []
 
@@ -1283,7 +1288,8 @@ def calculate_roster_replacement_cost(
         }
 
         rebuilt_lineup = calculate_optimal_lineup(
-            modified_positions
+            modified_positions,
+            roster_configuration
         )
 
         rebuilt_score = lineup_score(
@@ -2216,7 +2222,8 @@ def build_fantasy_analysis(roster_data, roster_configuration):
     for roster_id, team in analysis["teams"].items():
         
         optimal_lineup = calculate_optimal_lineup(
-            team["positions"]
+            team["positions"],
+            roster_configuration
         )
 
         team["optimal_lineup"] = optimal_lineup
@@ -2277,7 +2284,8 @@ def build_fantasy_analysis(roster_data, roster_configuration):
         )
         team["roster_replacement_cost"] = (
             calculate_roster_replacement_cost(
-            team
+            team,
+            roster_configuration
             )
         )       
         team["player_protection"] = (
