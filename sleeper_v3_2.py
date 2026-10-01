@@ -1017,10 +1017,37 @@ def classify_starting_depth(
         "starting_depth": starting_depth
     }
 def calculate_lineup_strength(
-    team
+    team,
+    roster_configuration,
     ):
 
     strength = {}
+    configured_slots = expand_roster_slots(roster_configuration)
+    direct_requirements = {
+        position: 0 for position in ("QB", "RB", "WR", "TE")
+    }
+    flex_slot_codes_by_position = {
+        position: [] for position in ("QB", "RB", "WR", "TE")
+    }
+
+    for slot in configured_slots:
+        if not slot["supported_by_analyzer"]:
+            continue
+
+        if slot["slot_type"] == "direct":
+            position = slot["slot_code"]
+            if position in direct_requirements:
+                direct_requirements[position] += 1
+        elif slot["slot_type"] == "flex":
+            for position in slot["eligible_positions"]:
+                if (
+                    position in flex_slot_codes_by_position
+                    and slot["slot_code"]
+                    not in flex_slot_codes_by_position[position]
+                ):
+                    flex_slot_codes_by_position[position].append(
+                        slot["slot_code"]
+                    )
 
     optimal_lineup = team.get(
         "optimal_lineup",
@@ -1042,17 +1069,10 @@ def calculate_lineup_strength(
             "meaningful_players"
         ]
 
-        direct_shortage = depth[
-            "direct_shortage"
-        ]
+        direct_shortage = depth.get("direct_shortage", 0)
 
         direct_players = optimal_lineup.get(
             position,
-            []
-        )
-
-        flex_players = optimal_lineup.get(
-            "FLEX",
             []
         )
 
@@ -1068,13 +1088,24 @@ def calculate_lineup_strength(
             for player in position_players
         }
 
-        flex_used = sum(
-            1
-            for player in flex_players
-            if player.get(
-                "player_id"
-            ) in position_ids
-        )
+        direct_player_ids = {
+            player.get("player_id")
+            for player in direct_players
+            if player.get("player_id") is not None
+        }
+        assigned_flex_player_ids = set()
+        for slot_code in flex_slot_codes_by_position[position]:
+            for player in optimal_lineup.get(slot_code, []):
+                player_id = player.get("player_id")
+                if (
+                    player_id in position_ids
+                    and player_id not in direct_player_ids
+                    and player_id not in assigned_flex_player_ids
+                ):
+                    assigned_flex_player_ids.add(player_id)
+        flex_used = len(assigned_flex_player_ids)
+
+        required = direct_requirements[position]
 
         if direct_shortage > 0:
 
@@ -1105,19 +1136,19 @@ def calculate_lineup_strength(
 
             if (
                 len(direct_players)
-                >= depth["required"]
+                >= required
                 and (
                     meaningful
-                    >= depth["required"] + 2
+                    >= required + 2
                 )
             ):
                 rating = "strong"
 
             elif (
                 len(direct_players)
-                >= depth["required"]
+                >= required
                 and meaningful
-                > depth["required"]
+                > required
             ):
                 rating = "adequate"
 
@@ -2620,11 +2651,10 @@ def build_fantasy_analysis(roster_data, roster_configuration):
                 )
             )
             
-        team["lineup_strength"] = (
-            calculate_lineup_strength(
-                team
-            )
-         )
+        team["lineup_strength"] = calculate_lineup_strength(
+            team,
+            roster_configuration,
+        )
         team["roster_surplus"] = (
             calculate_roster_surplus(
                 team

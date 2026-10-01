@@ -16,6 +16,7 @@ FUNCTIONS = {
     "classify_position_need",
     "classify_starting_depth",
     "get_position_slot_requirements",
+    "calculate_lineup_strength",
     "calculate_optimal_lineup",
     "build_fantasy_analysis",
     "parse_roster_configuration",
@@ -42,7 +43,6 @@ def load_analysis_functions():
         raise RuntimeError(f"Could not find expected functions: {FUNCTIONS - found}")
 
     namespace = {
-        "calculate_lineup_strength": _unused_analysis_stage,
         "calculate_roster_surplus": _unused_analysis_stage,
         "calculate_roster_replacement_cost": _unused_analysis_stage,
         "calculate_player_protection": _unused_analysis_stage,
@@ -346,6 +346,205 @@ class ConfigurationAwareOptimalLineupTests(unittest.TestCase):
         ]
         self.assertEqual(len(selected_ids), len(set(selected_ids)))
         json.dumps(lineup)
+
+
+class ConfigurationAwareLineupStrengthTests(unittest.TestCase):
+    positions = ("QB", "RB", "WR", "TE")
+
+    def make_team(self, roster_slots, players, direct_shortages=None):
+        configuration = ANALYSIS["parse_roster_configuration"](roster_slots)
+        position_groups = {position: [] for position in self.positions}
+        for player in players:
+            position_groups[player["position"]].append(player)
+
+        slots = ANALYSIS["expand_roster_slots"](configuration)
+        direct_requirements = {
+            position: sum(
+                slot["slot_type"] == "direct"
+                and slot["slot_code"] == position
+                for slot in slots
+            )
+            for position in self.positions
+        }
+        meaningful_tiers = {"elite", "strong", "useful"}
+        starting_depth = {
+            position: {
+                "required": direct_requirements[position],
+                "direct_shortage": (direct_shortages or {}).get(position, 0),
+                "meaningful_players": sum(
+                    player.get("fantasy_value_tier") in meaningful_tiers
+                    for player in position_groups[position]
+                ),
+            }
+            for position in self.positions
+        }
+        team = {
+            "positions": position_groups,
+            "starting_depth": starting_depth,
+            "optimal_lineup": ANALYSIS["calculate_optimal_lineup"](
+                position_groups, configuration
+            ),
+        }
+        return configuration, team
+
+    @staticmethod
+    def player(player_id, position, tier="useful", importance=0):
+        return {
+            "player_id": player_id,
+            "position": position,
+            "fantasy_value_tier": tier,
+            "importance_score": importance,
+        }
+
+    def evaluate(self, roster_slots, players, direct_shortages=None):
+        configuration, team = self.make_team(
+            roster_slots, players, direct_shortages
+        )
+        return ANALYSIS["calculate_lineup_strength"](team, configuration), team
+
+    def standard_players(self):
+        return [
+            self.player("qb", "QB", "elite"),
+            self.player("rb1", "RB", "elite"),
+            self.player("rb2", "RB", "strong"),
+            self.player("rb3", "RB", "useful"),
+            self.player("wr1", "WR", "elite"),
+            self.player("wr2", "WR", "strong"),
+            self.player("te", "TE", "strong"),
+        ]
+
+    def test_nlfl_strength_regression(self):
+        strength, _ = self.evaluate(
+            ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF"],
+            self.standard_players(),
+        )
+        self.assertEqual(
+            {position: value["rating"] for position, value in strength.items()},
+            {"QB": "adequate", "RB": "adequate", "WR": "weak", "TE": "adequate"},
+        )
+        self.assertEqual(strength["RB"]["flex_used"], 1)
+
+    def test_no_flex_uses_only_configured_direct_assignments(self):
+        strength, _ = self.evaluate(
+            ["QB", "RB", "RB", "WR", "WR", "TE"],
+            self.standard_players(),
+        )
+        self.assertTrue(all(value["flex_used"] == 0 for value in strength.values()))
+        self.assertEqual(strength["RB"]["rating"], "adequate")
+        self.assertEqual(strength["WR"]["rating"], "weak")
+
+    def test_two_flex_slots_participate_independently(self):
+        players = self.standard_players() + [
+            self.player("wr3", "WR", "useful"),
+            self.player("te2", "TE", "strong"),
+        ]
+        strength, team = self.evaluate(
+            ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "FLEX"],
+            players,
+        )
+        self.assertEqual(
+            sum(value["flex_used"] for value in strength.values()), 2
+        )
+        self.assertEqual(len(team["optimal_lineup"]["FLEX"]), 2)
+
+    def test_wrrb_flex_excludes_te(self):
+        strength, team = self.evaluate(
+            ["QB", "RB", "RB", "WR", "WR", "TE", "WRRB_FLEX"],
+            self.standard_players() + [self.player("te2", "TE", "elite")],
+        )
+        self.assertEqual(strength["TE"]["flex_used"], 0)
+        assigned = team["optimal_lineup"]["WRRB_FLEX"]
+        self.assertEqual(len(assigned), 1)
+        self.assertIn(assigned[0]["position"], {"RB", "WR"})
+
+    def test_rec_flex_excludes_rb(self):
+        strength, team = self.evaluate(
+            ["QB", "RB", "RB", "WR", "WR", "TE", "REC_FLEX"],
+            self.standard_players() + [
+                self.player("rb4", "RB", "elite"),
+                self.player("te2", "TE", "elite"),
+            ],
+        )
+        self.assertEqual(strength["RB"]["flex_used"], 0)
+        assigned = team["optimal_lineup"]["REC_FLEX"]
+        self.assertEqual(len(assigned), 1)
+        self.assertIn(assigned[0]["position"], {"WR", "TE"})
+
+    def test_super_flex_allows_qb_and_uses_player_once(self):
+        strength, team = self.evaluate(
+            ["QB", "RB", "RB", "WR", "WR", "TE", "SUPER_FLEX"],
+            self.standard_players() + [self.player("qb2", "QB", "elite", 10)],
+        )
+        assigned = team["optimal_lineup"]["SUPER_FLEX"]
+        self.assertEqual(len(assigned), 1)
+        self.assertEqual(assigned[0]["position"], "QB")
+        lineup_ids = [
+            player["player_id"]
+            for players in team["optimal_lineup"].values()
+            for player in players
+        ]
+        self.assertEqual(len(lineup_ids), len(set(lineup_ids)))
+        self.assertEqual(strength["QB"]["flex_used"], 1)
+
+    def test_unique_player_assignment_prevents_direct_flex_double_count(self):
+        players = [
+            self.player("wr-strong", "WR", "elite"),
+            self.player("wr-weaker", "WR", "fringe"),
+            self.player("rb", "RB", "useful"),
+        ]
+        strength, team = self.evaluate(["WR", "FLEX"], players)
+        lineup_ids = [
+            player["player_id"]
+            for players in team["optimal_lineup"].values()
+            for player in players
+        ]
+        self.assertEqual(len(lineup_ids), len(set(lineup_ids)))
+        self.assertEqual(strength["WR"]["flex_used"], 0)
+        self.assertEqual(strength["RB"]["flex_used"], 1)
+
+    def test_insufficient_players_keep_empty_slot_weak_behavior(self):
+        strength, team = self.evaluate(
+            ["QB", "QB"],
+            [self.player("qb", "QB", "elite")],
+            direct_shortages={"QB": 1},
+        )
+        self.assertEqual(len(team["optimal_lineup"]["QB"]), 1)
+        self.assertEqual(strength["QB"]["rating"], "weak")
+
+    def test_multiple_overlapping_flex_assignments_are_deterministic(self):
+        roster_slots = ["RB", "WR", "FLEX", "REC_FLEX"]
+        players = [
+            self.player("rb1", "RB", "elite"),
+            self.player("rb2", "RB", "useful"),
+            self.player("wr1", "WR", "elite"),
+            self.player("wr2", "WR", "strong"),
+            self.player("te1", "TE", "strong"),
+        ]
+        strength, team = self.evaluate(roster_slots, players)
+        _, repeated_team = self.make_team(roster_slots, players)
+        lineup_ids = [
+            player["player_id"]
+            for assigned in team["optimal_lineup"].values()
+            for player in assigned
+        ]
+        self.assertEqual(len(lineup_ids), len(set(lineup_ids)))
+        self.assertEqual(
+            sum(value["flex_used"] for value in strength.values()), 2
+        )
+        self.assertEqual(team["optimal_lineup"], repeated_team["optimal_lineup"])
+
+    def test_existing_rb_strength_thresholds_are_unchanged(self):
+        slots = ["RB"]
+        strong_players = [
+            self.player("rb1", "RB", "elite"),
+            self.player("rb2", "RB", "strong"),
+            self.player("rb3", "RB", "useful"),
+        ]
+        strength, _ = self.evaluate(slots, strong_players)
+        self.assertEqual(strength["RB"]["rating"], "strong")
+
+        adequate, _ = self.evaluate(slots, strong_players[:2])
+        self.assertEqual(adequate["RB"]["rating"], "adequate")
 
 
 class ConfigurationAwareLineupCoverageTests(unittest.TestCase):
