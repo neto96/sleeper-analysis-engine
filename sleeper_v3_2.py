@@ -118,6 +118,93 @@ def build_league_position_analysis(
 
     league_analysis = {}
 
+    roster_demands = {}
+    direct_demand_by_position = {position: 0 for position in positions}
+    flex_demand_by_code = {}
+    eligible_flex_demand_by_position = {position: 0 for position in positions}
+    total_configured_starting_slots = 0
+    total_supported_starting_slots = 0
+    unsupported_slot_counts = {}
+
+    for roster_id, team in fantasy_analysis["teams"].items():
+        roster_configuration = team.get(
+            "roster_configuration",
+            fantasy_analysis.get("roster_configuration", {}),
+        )
+        configured_slots = expand_roster_slots(roster_configuration)
+        direct_demand = {position: 0 for position in positions}
+        flex_slots = {}
+        unsupported_slots = {}
+        supported_slot_count = 0
+        configured_slot_count = 0
+
+        for slot in configured_slots:
+            if slot["slot_type"] == "nonstarter":
+                continue
+            configured_slot_count += 1
+
+            if (
+                slot["slot_type"] == "unknown"
+                or not slot["supported_by_analyzer"]
+            ):
+                slot_code = slot["slot_code"]
+                unsupported_slots[slot_code] = (
+                    unsupported_slots.get(slot_code, 0) + 1
+                )
+                unsupported_slot_counts[slot_code] = (
+                    unsupported_slot_counts.get(slot_code, 0) + 1
+                )
+                continue
+
+            if slot["slot_type"] == "direct":
+                slot_code = slot["slot_code"]
+                if slot_code in direct_demand:
+                    direct_demand[slot_code] += 1
+                    direct_demand_by_position[slot_code] += 1
+                    supported_slot_count += 1
+            elif slot["slot_type"] == "flex":
+                slot_code = slot["slot_code"]
+                flex_slots.setdefault(slot_code, {
+                    "count": 0,
+                    "eligible_positions": slot["eligible_positions"].copy(),
+                })
+                flex_slots[slot_code]["count"] += 1
+                supported_slot_count += 1
+
+        for slot_code, flex_slot in flex_slots.items():
+            aggregate = flex_demand_by_code.setdefault(slot_code, {
+                "count": 0,
+                "eligible_positions": flex_slot["eligible_positions"].copy(),
+            })
+            aggregate["count"] += flex_slot["count"]
+            for position in flex_slot["eligible_positions"]:
+                if position in eligible_flex_demand_by_position:
+                    eligible_flex_demand_by_position[position] += (
+                        flex_slot["count"]
+                    )
+
+        total_configured_starting_slots += configured_slot_count
+        total_supported_starting_slots += supported_slot_count
+        roster_demands[roster_id] = {
+            "direct_slots": direct_demand,
+            "flex_slots": flex_slots,
+            "configured_starting_slots": configured_slot_count,
+            "supported_starting_slots": supported_slot_count,
+            "unsupported_slots": dict(sorted(unsupported_slots.items())),
+        }
+
+    league_analysis["configuration_demand"] = {
+        "direct_demand_by_position": direct_demand_by_position,
+        "flex_demand_by_slot_code": dict(sorted(flex_demand_by_code.items())),
+        "eligible_flex_slot_instances_by_position": (
+            eligible_flex_demand_by_position
+        ),
+        "total_configured_starting_slots": total_configured_starting_slots,
+        "supported_starting_slots": total_supported_starting_slots,
+        "unsupported_slot_counts": dict(sorted(unsupported_slot_counts.items())),
+        "by_roster": roster_demands,
+    }
+
     for position in positions:
 
         team_counts = []
@@ -218,6 +305,13 @@ def build_league_position_analysis(
         league_analysis[position] = {
             "teams": team_counts,
 
+            "configured_direct_demand": direct_demand_by_position[position],
+            # This is shared capacity: values across positions overlap and
+            # must not be summed as independent positional requirements.
+            "eligible_flex_slot_instances": (
+                eligible_flex_demand_by_position[position]
+            ),
+
             "average_total": round(
                 sum(totals) / count,
                 2
@@ -269,35 +363,52 @@ def build_league_position_analysis(
 
     flex_team_counts = []
 
-    for roster_id, team in fantasy_analysis[
-        "teams"
-    ].items():
+    for roster_id, team in fantasy_analysis["teams"].items():
+        demand = roster_demands[roster_id]
+        flex_positions = sorted({
+            position
+            for flex_slot in demand["flex_slots"].values()
+            for position in flex_slot["eligible_positions"]
+        })
+        meaningful_tiers = {"elite", "strong", "useful"}
+        meaningful_players_by_position = {
+            position: [
+                player
+                for player in team.get("positions", {}).get(position, [])
+                if player.get("fantasy_value_tier") in meaningful_tiers
+            ]
+            for position in positions
+        }
+        direct_player_ids = set()
+        for position, required in demand["direct_slots"].items():
+            for index, player in enumerate(
+                meaningful_players_by_position.get(position, [])[:required]
+            ):
+                player_id = player.get("player_id")
+                direct_player_ids.add(
+                    ("player", str(player_id))
+                    if player_id is not None
+                    else ("missing_id", position, index)
+                )
 
-        rb_meaningful = team[
-            "position_summary"
-        ]["RB"]["meaningful_players"]
+        meaningful_flex_player_ids = set()
 
-        wr_meaningful = team[
-            "position_summary"
-        ]["WR"]["meaningful_players"]
+        for position in flex_positions:
+            for index, player in enumerate(
+                meaningful_players_by_position.get(position, [])
+            ):
+                player_id = player.get("player_id")
+                candidate_id = (
+                    ("player", str(player_id))
+                    if player_id is not None
+                    else ("missing_id", position, index)
+                )
+                if candidate_id not in direct_player_ids:
+                    meaningful_flex_player_ids.add(candidate_id)
 
-        te_meaningful = team[
-            "position_summary"
-        ]["TE"]["meaningful_players"]
-
-        flex_meaningful = (
-            max(
-                rb_meaningful - 2,
-                0
-            )
-            + max(
-                wr_meaningful - 2,
-                0
-            )
-            + max(
-                te_meaningful - 1,
-                0
-            )
+        flex_meaningful = len(meaningful_flex_player_ids)
+        configured_flex_slots = sum(
+            slot["count"] for slot in demand["flex_slots"].values()
         )
 
         flex_team_counts.append({
@@ -305,8 +416,8 @@ def build_league_position_analysis(
             "team_name": team[
                 "team_name"
             ],
-            "meaningful_flex_players":
-                flex_meaningful
+            "meaningful_flex_players": flex_meaningful,
+            "configured_flex_slots": configured_flex_slots,
         })
 
     if flex_team_counts:
@@ -347,6 +458,18 @@ def build_league_position_analysis(
 
         league_analysis["FLEX"] = {
             "teams": flex_team_counts,
+
+            "configured_slots": sum(
+                item["count"] for item in flex_demand_by_code.values()
+            ),
+            "slot_counts_by_type": {
+                slot_code: data["count"]
+                for slot_code, data in sorted(flex_demand_by_code.items())
+            },
+            "eligible_positions_by_type": {
+                slot_code: data["eligible_positions"]
+                for slot_code, data in sorted(flex_demand_by_code.items())
+            },
 
             "average_meaningful_players":
                 round(

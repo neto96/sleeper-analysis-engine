@@ -705,5 +705,186 @@ class ConfigurationAwareLineupCoverageTests(unittest.TestCase):
         )
 
 
+class ConfigurationAwareLeaguePositionAnalysisTests(unittest.TestCase):
+    def roster_team(self, roster_id, roster_slots, players):
+        roster = {
+            "team_name": f"Team {roster_id}",
+            "owner": "Test Owner",
+            "players": players,
+            "starters": [],
+            "reserve": [],
+            "taxi": [],
+        }
+        configuration = ANALYSIS["parse_roster_configuration"](roster_slots)
+        result = ANALYSIS["build_fantasy_analysis"](
+            {str(roster_id): roster}, configuration
+        )
+        team = result["teams"][str(roster_id)]
+        team["roster_configuration"] = configuration
+        return configuration, team
+
+    def analyze_league(self, roster_specs):
+        teams = {}
+        fallback_configuration = None
+        for roster_id, roster_slots, players in roster_specs:
+            configuration, team = self.roster_team(
+                roster_id, roster_slots, players
+            )
+            fallback_configuration = fallback_configuration or configuration
+            teams[str(roster_id)] = team
+        return ANALYSIS["build_league_position_analysis"]({
+            "roster_configuration": fallback_configuration,
+            "teams": teams,
+        })
+
+    @staticmethod
+    def player(player_id, position, search_rank=20):
+        return {
+            "player_id": player_id,
+            "position": position,
+            "search_rank": search_rank,
+        }
+
+    def test_nlfl_direct_and_flex_demand_regression(self):
+        league = self.analyze_league([(
+            1,
+            ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF"],
+            [self.player("qb", "QB"), self.player("rb1", "RB"),
+             self.player("rb2", "RB"), self.player("wr1", "WR"),
+             self.player("wr2", "WR"), self.player("te", "TE"),
+             self.player("k", "K"), self.player("def", "DEF")],
+        )])
+        demand = league["configuration_demand"]
+        self.assertEqual(demand["direct_demand_by_position"], {
+            "QB": 1, "RB": 2, "WR": 2, "TE": 1, "K": 1, "DEF": 1,
+        })
+        self.assertEqual(demand["flex_demand_by_slot_code"]["FLEX"]["count"], 1)
+        self.assertEqual(demand["total_configured_starting_slots"], 9)
+        self.assertEqual(
+            league["RB"]["median_depth_score"],
+            league["RB"]["teams"][0]["depth_score"],
+        )
+        self.assertEqual(league["RB"]["median_total"], 2)
+        self.assertEqual(league["RB"]["average_meaningful_players"], 2)
+        self.assertEqual(league["FLEX"]["configured_slots"], 1)
+
+    def test_no_flex_does_not_invent_flex_demand(self):
+        league = self.analyze_league([(
+            1, ["QB", "RB", "RB", "WR", "WR", "TE"],
+            [self.player("rb", "RB")],
+        )])
+        self.assertEqual(league["FLEX"]["configured_slots"], 0)
+        self.assertEqual(league["FLEX"]["average_meaningful_players"], 0)
+        self.assertEqual(
+            league["configuration_demand"]["flex_demand_by_slot_code"], {}
+        )
+        self.assertEqual(league["configuration_demand"]["direct_demand_by_position"]["RB"], 2)
+
+    def test_two_generic_flex_slots_are_shared_demand(self):
+        league = self.analyze_league([(
+            1, ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "FLEX"],
+            [self.player("rb", "RB")],
+        )])
+        demand = league["configuration_demand"]
+        self.assertEqual(demand["direct_demand_by_position"]["RB"], 2)
+        self.assertEqual(demand["direct_demand_by_position"]["WR"], 2)
+        self.assertEqual(demand["direct_demand_by_position"]["TE"], 1)
+        self.assertEqual(demand["flex_demand_by_slot_code"]["FLEX"]["count"], 2)
+        self.assertEqual(league["FLEX"]["configured_slots"], 2)
+        self.assertEqual(league["RB"]["eligible_flex_slot_instances"], 2)
+        self.assertEqual(league["WR"]["eligible_flex_slot_instances"], 2)
+        self.assertEqual(league["TE"]["eligible_flex_slot_instances"], 2)
+
+    def test_wrrb_and_rec_flex_eligibility_are_separate(self):
+        league = self.analyze_league([
+            (1, ["WRRB_FLEX"], [self.player("rb", "RB")]),
+            (2, ["REC_FLEX"], [self.player("wr", "WR")]),
+        ])
+        demand = league["configuration_demand"]
+        self.assertEqual(demand["flex_demand_by_slot_code"]["WRRB_FLEX"]["eligible_positions"], ["RB", "WR"])
+        self.assertEqual(demand["flex_demand_by_slot_code"]["REC_FLEX"]["eligible_positions"], ["WR", "TE"])
+        self.assertEqual(demand["eligible_flex_slot_instances_by_position"], {
+            "QB": 0, "RB": 1, "WR": 2, "TE": 1, "K": 0, "DEF": 0,
+        })
+
+    def test_super_flex_is_one_shared_slot_for_offensive_positions(self):
+        league = self.analyze_league([(
+            1, ["SUPER_FLEX"], [self.player("qb", "QB")],
+        )])
+        demand = league["configuration_demand"]
+        self.assertEqual(demand["total_configured_starting_slots"], 1)
+        self.assertEqual(demand["flex_demand_by_slot_code"]["SUPER_FLEX"]["count"], 1)
+        self.assertEqual(demand["direct_demand_by_position"], {
+            "QB": 0, "RB": 0, "WR": 0, "TE": 0, "K": 0, "DEF": 0,
+        })
+        self.assertEqual(
+            demand["eligible_flex_slot_instances_by_position"]["QB"], 1
+        )
+
+    def test_mixed_roster_configurations_sum_actual_roster_demand(self):
+        league = self.analyze_league([
+            (1, ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX"], []),
+            (2, ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "FLEX"], []),
+            (3, ["QB", "RB", "RB", "WR", "WR", "TE", "WRRB_FLEX"], []),
+        ])
+        demand = league["configuration_demand"]
+        self.assertEqual(demand["direct_demand_by_position"]["QB"], 3)
+        self.assertEqual(demand["direct_demand_by_position"]["RB"], 6)
+        self.assertEqual(demand["flex_demand_by_slot_code"]["FLEX"]["count"], 3)
+        self.assertEqual(demand["flex_demand_by_slot_code"]["WRRB_FLEX"]["count"], 1)
+        self.assertEqual(demand["total_configured_starting_slots"], 22)
+
+    def test_multiple_flex_types_count_actual_slots_not_eligible_position_sum(self):
+        league = self.analyze_league([(
+            1, ["FLEX", "REC_FLEX"], [],
+        )])
+        demand = league["configuration_demand"]
+        self.assertEqual(demand["total_configured_starting_slots"], 2)
+        self.assertEqual(league["FLEX"]["configured_slots"], 2)
+        self.assertEqual(demand["eligible_flex_slot_instances_by_position"], {
+            "QB": 0, "RB": 1, "WR": 2, "TE": 2, "K": 0, "DEF": 0,
+        })
+
+    def test_flex_supply_deduplicates_player_ids_across_groups(self):
+        configuration, team = self.roster_team(
+            1, ["FLEX", "REC_FLEX"],
+            [self.player("shared", "RB"), self.player("shared", "WR")],
+        )
+        league = ANALYSIS["build_league_position_analysis"]({
+            "roster_configuration": configuration,
+            "teams": {"1": team},
+        })
+        self.assertEqual(
+            league["FLEX"]["teams"][0]["meaningful_flex_players"], 1
+        )
+
+        configuration, team = self.roster_team(
+            2, ["RB", "FLEX", "REC_FLEX"],
+            [self.player("shared", "RB"), self.player("shared", "WR")],
+        )
+        league = ANALYSIS["build_league_position_analysis"]({
+            "roster_configuration": configuration,
+            "teams": {"2": team},
+        })
+        self.assertEqual(
+            league["FLEX"]["teams"][0]["meaningful_flex_players"], 0
+        )
+
+    def test_unknown_and_unsupported_slots_do_not_become_position_demand(self):
+        league = self.analyze_league([(
+            1, ["CUSTOM_SLOT", "IDP_FLEX", "RB"],
+            [self.player("rb", "RB")],
+        )])
+        demand = league["configuration_demand"]
+        self.assertEqual(demand["direct_demand_by_position"]["RB"], 1)
+        self.assertEqual(demand["direct_demand_by_position"]["QB"], 0)
+        self.assertEqual(demand["flex_demand_by_slot_code"], {})
+        self.assertEqual(demand["total_configured_starting_slots"], 3)
+        self.assertEqual(demand["supported_starting_slots"], 1)
+        self.assertEqual(demand["unsupported_slot_counts"], {
+            "CUSTOM_SLOT": 1, "IDP_FLEX": 1,
+        })
+
+
 if __name__ == "__main__":
     unittest.main()
