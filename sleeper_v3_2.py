@@ -367,20 +367,35 @@ def build_league_position_analysis(
 
     return league_analysis
 
+def get_position_slot_requirements(position, configured_slots):
+    """Return direct demand and shared FLEX types eligible for a position."""
+    direct_required = sum(
+        1
+        for slot in configured_slots
+        if slot["slot_type"] == "direct"
+        and slot["slot_code"] == position
+        and slot["supported_by_analyzer"]
+    )
+    flex_slot_codes = sorted({
+        slot["slot_code"]
+        for slot in configured_slots
+        if slot["slot_type"] == "flex"
+        and slot["supported_by_analyzer"]
+        and position in slot["eligible_positions"]
+    })
+
+    return {
+        "direct_required": direct_required,
+        "flex_slot_codes": flex_slot_codes,
+    }
+
+
 def classify_position_need(
     position,
     team_summary,
-    league_position_analysis
+    league_position_analysis,
+    configured_slots,
     ):
-
-    required = {
-        "QB": 1,
-        "RB": 2,
-        "WR": 2,
-        "TE": 1,
-        "K": 1,
-        "DEF": 1
-    }
 
     meaningful = team_summary.get(
         "meaningful_players",
@@ -417,10 +432,11 @@ def classify_position_need(
         0
     )
 
-    required_players = required.get(
+    slot_requirements = get_position_slot_requirements(
         position,
-        0
+        configured_slots,
     )
+    required_players = slot_requirements["direct_required"]
 
     starting_shortage = max(
         required_players - starters,
@@ -573,37 +589,28 @@ def calculate_optimal_lineup(positions, roster_configuration):
         "FLEX": []
     }
     slots = []
-    direct_slots = roster_configuration.get("direct_slots", {})
 
-    for position in supported_positions:
-        count = max(0, int(direct_slots.get(position, 0)))
-        for _ in range(count):
-            slots.append({
-                "lineup_position": position,
-                "eligible_positions": [position],
-                "is_flex": False,
-            })
-
-    flex_slots = roster_configuration.get("flex_slots", {})
-    for slot_code in sorted(flex_slots):
-        slot_data = flex_slots[slot_code]
-        count = max(0, int(slot_data.get("count", 0)))
-        eligible_positions = [
-            position
-            for position in slot_data.get("eligible_positions", [])
-            if position in supported_positions
-        ]
-
-        if not count or not eligible_positions:
+    for configured_slot in expand_roster_slots(roster_configuration):
+        if configured_slot["slot_type"] not in {"direct", "flex"}:
             continue
 
-        best_lineup.setdefault(slot_code, [])
-        for _ in range(count):
-            slots.append({
-                "lineup_position": slot_code,
-                "eligible_positions": eligible_positions,
-                "is_flex": True,
-            })
+        eligible_positions = [
+            position
+            for position in configured_slot["eligible_positions"]
+            if position in supported_positions
+        ]
+        if not eligible_positions:
+            continue
+
+        slot_code = configured_slot["slot_code"]
+        if configured_slot["is_flex"]:
+            best_lineup.setdefault(slot_code, [])
+
+        slots.append({
+            "lineup_position": slot_code,
+            "eligible_positions": eligible_positions,
+            "is_flex": configured_slot["is_flex"],
+        })
 
     candidates = []
     seen_player_ids = set()
@@ -752,20 +759,14 @@ def classify_starting_depth(
     position,
     team_summary,
     positions,
-    optimal_lineup
+    optimal_lineup,
+    configured_slots,
     ):
-
-    required = {
-        "QB": 1,
-        "RB": 2,
-        "WR": 2,
-        "TE": 1
-    }
-
-    required_players = required.get(
+    slot_requirements = get_position_slot_requirements(
         position,
-        0
+        configured_slots,
     )
+    required_players = slot_requirements["direct_required"]
 
     starters = team_summary.get(
         "starters",
@@ -787,12 +788,41 @@ def classify_starting_depth(
         0
     )
 
+    position_ids = {
+        player.get("player_id")
+        for player in positions.get(position, [])
+    }
+    flex_player_ids = set()
+    for slot_code in slot_requirements["flex_slot_codes"]:
+        for player in optimal_lineup.get(slot_code, []):
+            player_id = player.get("player_id")
+            if (
+                player_id in position_ids
+                and player.get("position", position) == position
+            ):
+                flex_player_ids.add(player_id)
+    flex_available = len(flex_player_ids)
+
+    if required_players == 0 and flex_available == 0:
+        starting_depth = "adequate"
+
+        return {
+            "required": required_players,
+            "starters": starters,
+            "direct_shortage": direct_shortage,
+            "direct_surplus": direct_surplus,
+            "meaningful_players": meaningful,
+            "flex_available": flex_available,
+            "starting_depth": starting_depth
+        }
+
     if position == "QB":
 
-        if meaningful == 0:
+        effective_required = required_players + flex_available
+        if meaningful < effective_required:
             starting_depth = "short"
 
-        elif meaningful == 1:
+        elif meaningful == effective_required:
             starting_depth = "thin"
 
         else:
@@ -804,36 +834,17 @@ def classify_starting_depth(
             "direct_shortage": direct_shortage,
             "direct_surplus": direct_surplus,
             "meaningful_players": meaningful,
-            "flex_available": 0,
+            "flex_available": flex_available,
             "starting_depth": starting_depth
         }
 
     if position == "TE":
 
-        flex_available = 0
-
-        for player in optimal_lineup.get(
-            "FLEX",
-            []
-        ):
-
-            if player.get(
-                "player_id"
-            ) in {
-                p.get("player_id")
-                for p in positions.get(
-                    "TE",
-                    []
-                )
-            }:
-
-                flex_available += 1
-
         if direct_shortage > 0:
 
             starting_depth = "short"
 
-        elif meaningful <= required_players:
+        elif meaningful <= required_players + flex_available:
 
             starting_depth = "thin"
 
@@ -850,32 +861,6 @@ def classify_starting_depth(
             "flex_available": flex_available,
             "starting_depth": starting_depth
         }
-
-    direct_players = optimal_lineup.get(
-        position,
-        []
-    )
-
-    flex_players = optimal_lineup.get(
-        "FLEX",
-        []
-    )
-
-    position_ids = {
-        player.get("player_id")
-        for player in positions.get(
-            position,
-            []
-        )
-    }
-
-    flex_available = sum(
-        1
-        for player in flex_players
-        if player.get(
-            "player_id"
-        ) in position_ids
-    )
 
     if direct_shortage > 0:
 
@@ -1939,28 +1924,285 @@ def parse_roster_configuration(roster_positions):
         "unrecognized_slots": dict(sorted(unrecognized_slots.items())),
     }
 
+
+def get_slot_eligible_positions(slot_code, roster_configuration):
+    """Return the configured player positions eligible for one slot code."""
+    normalized_code = str(slot_code).strip().upper()
+    configuration = roster_configuration or {}
+
+    if normalized_code in configuration.get("direct_slots", {}):
+        return [normalized_code]
+
+    flex_slot = configuration.get("flex_slots", {}).get(normalized_code)
+    if flex_slot is not None:
+        return list(flex_slot.get("eligible_positions", []))
+
+    return []
+
+
+def expand_roster_slots(roster_configuration):
+    """Expand normalized roster counts into deterministic slot instances."""
+    configuration = roster_configuration or {}
+    direct_slots = configuration.get("direct_slots", {})
+    flex_slots = configuration.get("flex_slots", {})
+    nonstarter_slots = configuration.get("nonstarter_slots", {})
+    unrecognized_slots = configuration.get("unrecognized_slots", {})
+
+    analyzer_supported_positions = {
+        "QB", "RB", "WR", "TE", "K", "DEF"
+    }
+    ordered_codes = [
+        code for code in ["QB", "RB", "WR", "TE"]
+        if code in direct_slots
+    ]
+    ordered_codes.extend(
+        sorted(code for code in flex_slots if code == "FLEX")
+    )
+    ordered_codes.extend(
+        sorted(code for code in flex_slots if code != "FLEX")
+    )
+    ordered_codes.extend(
+        code for code in ["K", "DEF", "DL", "LB", "DB"]
+        if code in direct_slots
+    )
+
+    slots = []
+
+    def add_instances(slot_code, count, slot_type, recognized):
+        try:
+            count = max(0, int(count))
+        except (TypeError, ValueError):
+            count = 0
+
+        eligible_positions = get_slot_eligible_positions(
+            slot_code,
+            configuration,
+        )
+        supported = bool(
+            set(eligible_positions) & analyzer_supported_positions
+        )
+
+        for ordinal in range(1, count + 1):
+            slots.append({
+                "slot_code": slot_code,
+                "ordinal": ordinal,
+                "eligible_positions": eligible_positions.copy(),
+                "slot_type": slot_type,
+                "is_direct": slot_type == "direct",
+                "is_flex": slot_type == "flex",
+                "recognized": recognized,
+                "supported_by_analyzer": supported,
+            })
+
+    for slot_code in ordered_codes:
+        if slot_code in direct_slots:
+            add_instances(
+                slot_code,
+                direct_slots[slot_code],
+                "direct",
+                True,
+            )
+        else:
+            flex_slot = flex_slots[slot_code]
+            add_instances(
+                slot_code,
+                flex_slot.get("count", 0),
+                "flex",
+                True,
+            )
+
+    for slot_code in sorted(nonstarter_slots):
+        add_instances(slot_code, nonstarter_slots[slot_code], "nonstarter", True)
+
+    for slot_code in sorted(unrecognized_slots):
+        add_instances(
+            slot_code,
+            unrecognized_slots[slot_code],
+            "unknown",
+            False,
+        )
+
+    return slots
+
+
+def assign_roster_slot_coverage(slot_instances, positions):
+    """Assign unique roster players to the maximum number of supported slots."""
+    supported_positions = {"QB", "RB", "WR", "TE", "K", "DEF"}
+    meaningful_tiers = {"elite", "strong", "useful"}
+    supported_slots = []
+    unsupported_slots = {}
+    candidates_by_slot = []
+    eligible_player_ids_by_flex = {}
+    all_flex_eligible_player_ids = set()
+
+    for slot in slot_instances:
+        if slot["slot_type"] == "nonstarter":
+            continue
+
+        if (
+            slot["slot_type"] == "unknown"
+            or not slot["supported_by_analyzer"]
+        ):
+            slot_code = slot["slot_code"]
+            unsupported_slots[slot_code] = (
+                unsupported_slots.get(slot_code, 0) + 1
+            )
+            continue
+
+        if slot["slot_type"] not in {"direct", "flex"}:
+            continue
+
+        eligible_positions = [
+            position
+            for position in slot["eligible_positions"]
+            if position in supported_positions
+        ]
+        slot_candidates = []
+        seen_ids = set()
+
+        for position in eligible_positions:
+            for index, player in enumerate(positions.get(position, [])):
+                player_id = player.get("player_id")
+                candidate_id = (
+                    ("player", str(player_id))
+                    if player_id is not None
+                    else ("missing_id", position, index)
+                )
+
+                if candidate_id in seen_ids:
+                    continue
+
+                if slot["is_flex"] and (
+                    player.get("status") == "Inactive"
+                    or player.get("injury_status") == "IR"
+                    or player.get("fantasy_value_tier") not in meaningful_tiers
+                ):
+                    continue
+
+                seen_ids.add(candidate_id)
+                slot_candidates.append({
+                    "candidate_id": candidate_id,
+                    "player_id": player_id,
+                    "position": position,
+                })
+
+        if slot["is_flex"]:
+            eligible_player_ids_by_flex.setdefault(slot["slot_code"], set())
+            candidate_ids = {
+                candidate["candidate_id"] for candidate in slot_candidates
+            }
+            eligible_player_ids_by_flex[slot["slot_code"]].update(candidate_ids)
+            all_flex_eligible_player_ids.update(candidate_ids)
+
+        supported_slots.append(slot)
+        candidates_by_slot.append(slot_candidates)
+
+    best_assignment = None
+    best_covered_count = -1
+
+    def search(slot_index, used_candidate_ids, assignment, covered_count):
+        nonlocal best_assignment, best_covered_count
+
+        if slot_index == len(supported_slots):
+            if covered_count > best_covered_count:
+                best_covered_count = covered_count
+                best_assignment = assignment.copy()
+            return
+
+        if covered_count + len(supported_slots) - slot_index <= best_covered_count:
+            return
+
+        for candidate in candidates_by_slot[slot_index]:
+            candidate_id = candidate["candidate_id"]
+            if candidate_id in used_candidate_ids:
+                continue
+
+            used_candidate_ids.add(candidate_id)
+            assignment.append(candidate)
+            search(
+                slot_index + 1,
+                used_candidate_ids,
+                assignment,
+                covered_count + 1,
+            )
+            assignment.pop()
+            used_candidate_ids.remove(candidate_id)
+
+        assignment.append(None)
+        search(slot_index + 1, used_candidate_ids, assignment, covered_count)
+        assignment.pop()
+
+    search(0, set(), [], 0)
+
+    assignments = []
+    for slot, candidate in zip(supported_slots, best_assignment or []):
+        if candidate is not None:
+            assignments.append({
+                "slot_code": slot["slot_code"],
+                "ordinal": slot["ordinal"],
+                "slot_type": slot["slot_type"],
+                "player_id": candidate["player_id"],
+                "position": candidate["position"],
+            })
+
+    return {
+        "assignments": assignments,
+        "supported_slot_count": len(supported_slots),
+        "covered_slot_count": len(assignments),
+        "unsupported_slots": dict(sorted(unsupported_slots.items())),
+        "eligible_player_counts_by_flex": {
+            slot_code: len(player_ids)
+            for slot_code, player_ids in sorted(
+                eligible_player_ids_by_flex.items()
+            )
+        },
+        "eligible_player_count_across_flex": len(
+            all_flex_eligible_player_ids
+        ),
+    }
+
+
 def build_fantasy_analysis(roster_data, roster_configuration):
-
+    configured_slots = expand_roster_slots(roster_configuration)
+    direct_positions = ["QB", "RB", "WR", "TE", "K", "DEF"]
     lineup_requirements = {
-        "QB": 1,
-        "RB": 2,
-        "WR": 2,
-        "TE": 1,
-        "K": 1,
-        "DEF": 1,
-        "FLEX": 1
+        position: sum(
+            1
+            for slot in configured_slots
+            if slot["slot_type"] == "direct"
+            and slot["slot_code"] == position
+        )
+        for position in direct_positions
     }
+    for slot in configured_slots:
+        if slot["slot_type"] == "direct" and slot["slot_code"] not in lineup_requirements:
+            lineup_requirements[slot["slot_code"]] = (
+                lineup_requirements.get(slot["slot_code"], 0) + 1
+            )
 
-    flex_positions = {
-        "RB",
-        "WR",
-        "TE"
-    }
+    flex_slots_by_code = {}
+    for slot in configured_slots:
+        if slot["is_flex"]:
+            flex_slots_by_code.setdefault(slot["slot_code"], {
+                "count": 0,
+                "eligible_positions": slot["eligible_positions"].copy(),
+            })
+            flex_slots_by_code[slot["slot_code"]]["count"] += 1
+
+    lineup_requirements["FLEX"] = sum(
+        flex_slot["count"] for flex_slot in flex_slots_by_code.values()
+    )
+    flex_positions = sorted({
+        position
+        for flex_slot in flex_slots_by_code.values()
+        for position in flex_slot["eligible_positions"]
+    })
 
     analysis = {
         "roster_configuration": roster_configuration,
         "lineup_requirements": lineup_requirements,
         "flex_positions": sorted(flex_positions),
+        "flex_slot_requirements": flex_slots_by_code,
         "teams": {}
     }
 
@@ -2085,105 +2327,86 @@ def build_fantasy_analysis(roster_data, roster_configuration):
         # LINEUP COVERAGE
         # ------------------------------------------
 
+        coverage_result = assign_roster_slot_coverage(
+            configured_slots,
+            positions,
+        )
+        assignments = coverage_result["assignments"]
         lineup_coverage = {}
 
-        for position in [
-            "QB",
-            "RB",
-            "WR",
-            "TE",
-            "K",
-            "DEF"
-        ]:
-
-            total_players = len(
-                positions[position]
-            )
-
-            required = lineup_requirements.get(
-                position,
-                0
-            )
-
-            direct_coverage = min(
-                total_players,
-                required
-            )
-
-            surplus = max(
-                total_players - required,
-                0
-            )
-
-            shortage = max(
-                required - total_players,
-                0
+        for position in direct_positions:
+            total_players = len(positions[position])
+            required = lineup_requirements[position]
+            direct_coverage = sum(
+                1
+                for assignment in assignments
+                if assignment["slot_type"] == "direct"
+                and assignment["slot_code"] == position
             )
 
             lineup_coverage[position] = {
                 "required": required,
                 "total": total_players,
                 "direct_coverage": direct_coverage,
-                "surplus": surplus,
-                "shortage": shortage
+                "surplus": max(total_players - required, 0),
+                "shortage": max(required - direct_coverage, 0),
             }
 
-        # FLEX can be covered by usable RB/WR/TE players
-        flex_eligible_players = 0
-
-        for position in [
-            "RB",
-            "WR",
-            "TE"
-        ]:
-
-            usable_players = [
-                player
-                for player in positions.get(
-                    position,
-                    []
-                )
-                if player.get(
-                    "status"
-                ) != "Inactive"
-                and player.get(
-                    "injury_status"
-                ) != "IR"
-                and player.get(
-                    "fantasy_value_tier"
-                ) in [
-                    "elite",
-                    "strong",
-                    "useful"
-                ]
-            ]
-
-            required = {
-                "RB": 2,
-                "WR": 2,
-                "TE": 1
-            }[position]
-
-            flex_eligible_players += max(
-                len(usable_players) - required,
-                0
+        flex_coverage_by_code = {}
+        for slot_code, flex_slot in flex_slots_by_code.items():
+            supported_required = sum(
+                1
+                for slot in configured_slots
+                if slot["slot_type"] == "flex"
+                and slot["slot_code"] == slot_code
+                and slot["supported_by_analyzer"]
             )
+            flex_coverage = sum(
+                1
+                for assignment in assignments
+                if assignment["slot_type"] == "flex"
+                and assignment["slot_code"] == slot_code
+            )
+            flex_coverage_by_code[slot_code] = {
+                "required": flex_slot["count"],
+                "supported_required": supported_required,
+                "eligible_players": coverage_result[
+                    "eligible_player_counts_by_flex"
+                ].get(slot_code, 0),
+                "coverage": flex_coverage,
+                "shortage": max(supported_required - flex_coverage, 0),
+                "unsupported": flex_slot["count"] - supported_required,
+            }
 
-        flex_required = lineup_requirements["FLEX"]
-
-        flex_coverage = min(
-            flex_eligible_players,
-            flex_required
+        supported_flex_required = sum(
+            data["supported_required"]
+            for data in flex_coverage_by_code.values()
         )
-
+        flex_coverage = sum(
+            data["coverage"] for data in flex_coverage_by_code.values()
+        )
         lineup_coverage["FLEX"] = {
-            "required": flex_required,
-            "eligible_players": flex_eligible_players,
+            "required": lineup_requirements["FLEX"],
+            "supported_required": supported_flex_required,
+            "eligible_players": coverage_result[
+                "eligible_player_count_across_flex"
+            ],
             "coverage": flex_coverage,
-            "shortage": max(
-                flex_required - flex_eligible_players,
-                0
-            )
+            "shortage": max(supported_flex_required - flex_coverage, 0),
+            "unsupported": lineup_requirements["FLEX"] - supported_flex_required,
+        }
+        lineup_coverage["flex_slots"] = flex_coverage_by_code
+        lineup_coverage["summary"] = {
+            "supported_configured_slots": coverage_result[
+                "supported_slot_count"
+            ],
+            "covered_slots": coverage_result["covered_slot_count"],
+            "uncovered_slots": (
+                coverage_result["supported_slot_count"]
+                - coverage_result["covered_slot_count"]
+            ),
+            "unsupported_slots": coverage_result["unsupported_slots"],
+            "assignments": assignments,
         }
             
         analysis["teams"][str(roster_id)] = {
@@ -2247,7 +2470,8 @@ def build_fantasy_analysis(roster_data, roster_configuration):
                     team_summary,
                     analysis[
                         "league_position_analysis"
-                    ]
+                    ],
+                    configured_slots,
                 )
             )
         team["starting_depth"] = {}
@@ -2268,7 +2492,8 @@ def build_fantasy_analysis(roster_data, roster_configuration):
                     position,
                     team_summary,
                     team["positions"],
-                    optimal_lineup
+                    optimal_lineup,
+                    configured_slots,
                 )
             )
             

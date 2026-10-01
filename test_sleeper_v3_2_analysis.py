@@ -13,9 +13,15 @@ FUNCTIONS = {
     "fantasy_importance_score",
     "build_league_position_analysis",
     "classify_league_scarcity",
+    "classify_position_need",
+    "classify_starting_depth",
+    "get_position_slot_requirements",
     "calculate_optimal_lineup",
     "build_fantasy_analysis",
     "parse_roster_configuration",
+    "get_slot_eligible_positions",
+    "expand_roster_slots",
+    "assign_roster_slot_coverage",
 }
 
 
@@ -36,8 +42,6 @@ def load_analysis_functions():
         raise RuntimeError(f"Could not find expected functions: {FUNCTIONS - found}")
 
     namespace = {
-        "classify_position_need": _unused_analysis_stage,
-        "classify_starting_depth": _unused_analysis_stage,
         "calculate_lineup_strength": _unused_analysis_stage,
         "calculate_roster_surplus": _unused_analysis_stage,
         "calculate_roster_replacement_cost": _unused_analysis_stage,
@@ -174,6 +178,14 @@ class V32AnalysisCharacterizationTests(unittest.TestCase):
         self.assertEqual(team["lineup_coverage"]["DEF"]["required"], 1)
         self.assertEqual(team["lineup_coverage"]["FLEX"]["coverage"], 1)
         self.assertEqual(team["lineup_coverage"]["FLEX"]["shortage"], 0)
+        coverage_summary = team["lineup_coverage"]["summary"]
+        self.assertEqual(coverage_summary["supported_configured_slots"], 9)
+        self.assertEqual(coverage_summary["covered_slots"], 9)
+        self.assertEqual(coverage_summary["uncovered_slots"], 0)
+        self.assertEqual(
+            len({item["player_id"] for item in coverage_summary["assignments"]}),
+            9,
+        )
         json.dumps(analysis)
 
 
@@ -334,6 +346,363 @@ class ConfigurationAwareOptimalLineupTests(unittest.TestCase):
         ]
         self.assertEqual(len(selected_ids), len(set(selected_ids)))
         json.dumps(lineup)
+
+
+class ConfigurationAwareLineupCoverageTests(unittest.TestCase):
+    def player(self, player_id, position, search_rank=20, **extra):
+        return {
+            "player_id": player_id,
+            "position": position,
+            "search_rank": search_rank,
+            **extra,
+        }
+
+    def analyze(self, roster_slots, players, **roster_overrides):
+        roster = {
+            "team_name": "Coverage Test",
+            "owner": "Test Owner",
+            "players": players,
+            "starters": [],
+            "reserve": [],
+            "taxi": [],
+            **roster_overrides,
+        }
+        return ANALYSIS["build_fantasy_analysis"](
+            {"3": roster},
+            ANALYSIS["parse_roster_configuration"](roster_slots),
+        )
+
+    def test_nlfl_configuration_reports_unique_slot_coverage(self):
+        players = [
+            self.player("qb", "QB"),
+            self.player("rb1", "RB"), self.player("rb2", "RB"),
+            self.player("rb3", "RB"),
+            self.player("wr1", "WR"), self.player("wr2", "WR"),
+            self.player("wr3", "WR"),
+            self.player("te1", "TE"),
+            self.player("k", "K"), self.player("def", "DEF"),
+        ]
+        analysis = self.analyze(
+            ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF"],
+            players,
+        )
+        team = analysis["teams"]["3"]
+        self.assertEqual(analysis["lineup_requirements"], {
+            "QB": 1, "RB": 2, "WR": 2, "TE": 1,
+            "K": 1, "DEF": 1, "FLEX": 1,
+        })
+        self.assertEqual(team["lineup_coverage"]["summary"]["covered_slots"], 9)
+        self.assertEqual(team["lineup_coverage"]["K"]["direct_coverage"], 1)
+        self.assertEqual(team["lineup_coverage"]["DEF"]["direct_coverage"], 1)
+
+    def test_two_generic_flex_slots_do_not_double_count_direct_players(self):
+        players = [
+            self.player("qb", "QB"),
+            self.player("rb1", "RB"), self.player("rb2", "RB"),
+            self.player("rb3", "RB"),
+            self.player("wr1", "WR"), self.player("wr2", "WR"),
+            self.player("wr3", "WR"),
+            self.player("te1", "TE"), self.player("te2", "TE"),
+            self.player("k", "K"), self.player("def", "DEF"),
+        ]
+        analysis = self.analyze(
+            ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "FLEX", "K", "DEF"],
+            players,
+        )
+        coverage = analysis["teams"]["3"]["lineup_coverage"]
+        assignments = coverage["summary"]["assignments"]
+        self.assertEqual(coverage["FLEX"]["coverage"], 2)
+        self.assertEqual(len(assignments), 10)
+        self.assertEqual(
+            len({assignment["player_id"] for assignment in assignments}),
+            len(assignments),
+        )
+
+    def test_mixed_flex_types_share_players_without_reuse(self):
+        analysis = self.analyze(
+            ["WRRB_FLEX", "REC_FLEX"],
+            [
+                self.player("wr1", "WR"), self.player("wr2", "WR"),
+                self.player("rb1", "RB"), self.player("te1", "TE"),
+            ],
+        )
+        coverage = analysis["teams"]["3"]["lineup_coverage"]
+        self.assertEqual(coverage["flex_slots"]["WRRB_FLEX"]["coverage"], 1)
+        self.assertEqual(coverage["flex_slots"]["REC_FLEX"]["coverage"], 1)
+        ids = [item["player_id"] for item in coverage["summary"]["assignments"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_super_flex_accepts_qb_rb_or_wr_with_unique_assignment(self):
+        analysis = self.analyze(
+            ["QB", "RB", "RB", "WR", "WR", "SUPER_FLEX"],
+            [
+                self.player("qb1", "QB"), self.player("qb2", "QB"),
+                self.player("rb1", "RB"), self.player("rb2", "RB"),
+                self.player("rb3", "RB"),
+                self.player("wr1", "WR"), self.player("wr2", "WR"),
+                self.player("wr3", "WR"),
+            ],
+        )
+        coverage = analysis["teams"]["3"]["lineup_coverage"]
+        super_flex = [
+            item for item in coverage["summary"]["assignments"]
+            if item["slot_code"] == "SUPER_FLEX"
+        ]
+        self.assertEqual(len(super_flex), 1)
+        self.assertIn(super_flex[0]["position"], {"QB", "RB", "WR"})
+        ids = [item["player_id"] for item in coverage["summary"]["assignments"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_k_and_def_coverage_is_separate_from_offensive_flex(self):
+        analysis = self.analyze(
+            ["K", "DEF", "FLEX"],
+            [self.player("k", "K"), self.player("def", "DEF"),
+             self.player("wr", "WR")],
+        )
+        coverage = analysis["teams"]["3"]["lineup_coverage"]
+        self.assertEqual(coverage["K"]["direct_coverage"], 1)
+        self.assertEqual(coverage["DEF"]["direct_coverage"], 1)
+        self.assertEqual(coverage["FLEX"]["coverage"], 1)
+        flex_assignment = next(
+            item for item in coverage["summary"]["assignments"]
+            if item["slot_type"] == "flex"
+        )
+        self.assertEqual(flex_assignment["player_id"], "wr")
+
+    def test_zero_flex_does_not_invent_flex_demand(self):
+        analysis = self.analyze(["RB"], [self.player("rb", "RB")])
+        self.assertEqual(analysis["lineup_requirements"]["FLEX"], 0)
+        self.assertEqual(analysis["flex_positions"], [])
+        coverage = analysis["teams"]["3"]["lineup_coverage"]
+        self.assertEqual(coverage["FLEX"]["required"], 0)
+        self.assertEqual(coverage["FLEX"]["coverage"], 0)
+
+    def test_zero_direct_position_requirement_stays_zero(self):
+        analysis = self.analyze(
+            ["WR"], [self.player("rb", "RB"), self.player("wr", "WR")]
+        )
+        coverage = analysis["teams"]["3"]["lineup_coverage"]
+        self.assertEqual(analysis["lineup_requirements"]["RB"], 0)
+        self.assertEqual(coverage["RB"]["required"], 0)
+        self.assertEqual(coverage["RB"]["direct_coverage"], 0)
+
+    def test_overlapping_flex_slots_cannot_cover_more_slots_than_players(self):
+        analysis = self.analyze(
+            ["FLEX", "REC_FLEX"],
+            [self.player("only-wr", "WR")],
+        )
+        coverage = analysis["teams"]["3"]["lineup_coverage"]
+        assignments = coverage["summary"]["assignments"]
+        unique_candidate_ids = {"only-wr"}
+        self.assertEqual(coverage["FLEX"]["required"], 2)
+        self.assertEqual(coverage["FLEX"]["coverage"], 1)
+        self.assertLessEqual(coverage["summary"]["covered_slots"], len(unique_candidate_ids))
+        self.assertEqual(
+            len({item["player_id"] for item in assignments}), len(assignments)
+        )
+
+    def test_unknown_and_idp_slots_are_visible_but_not_supported_coverage(self):
+        analysis = self.analyze(
+            ["RB", "CUSTOM_SLOT", "IDP_FLEX"],
+            [self.player("rb", "RB")],
+        )
+        self.assertEqual(
+            analysis["roster_configuration"]["unrecognized_slots"],
+            {"CUSTOM_SLOT": 1},
+        )
+        coverage = analysis["teams"]["3"]["lineup_coverage"]
+        self.assertEqual(coverage["summary"]["unsupported_slots"], {
+            "CUSTOM_SLOT": 1, "IDP_FLEX": 1,
+        })
+        self.assertEqual(coverage["FLEX"]["supported_required"], 0)
+        self.assertEqual(coverage["FLEX"]["unsupported"], 1)
+
+    def test_coverage_preserves_direct_and_flex_availability_rules(self):
+        players = [
+            self.player("ir", "RB", injury_status="IR"),
+            self.player("inactive", "RB", status="Inactive"),
+            self.player("reserve", "RB"),
+        ]
+        analysis = self.analyze(
+            ["RB", "FLEX"],
+            players,
+            reserve=[{"player_id": "reserve"}],
+        )
+        coverage = analysis["teams"]["3"]["lineup_coverage"]
+        assignments = coverage["summary"]["assignments"]
+        direct = next(item for item in assignments if item["slot_type"] == "direct")
+        flex = next(item for item in assignments if item["slot_type"] == "flex")
+        self.assertEqual(direct["player_id"], "ir")
+        self.assertEqual(flex["player_id"], "reserve")
+        self.assertEqual(coverage["FLEX"]["eligible_players"], 1)
+
+    def test_nlfl_position_need_and_starting_depth_regression(self):
+        players = [
+            self.player("qb1", "QB", 10), self.player("qb2", "QB", 100),
+            self.player("rb1", "RB", 10), self.player("rb2", "RB", 20),
+            self.player("rb3", "RB", 60), self.player("rb4", "RB", 180),
+            self.player("wr1", "WR", 10), self.player("wr2", "WR", 60),
+            self.player("wr3", "WR", 180),
+            self.player("te1", "TE", 10),
+        ]
+        starters = [
+            {"player_id": player_id}
+            for player_id in ("qb1", "rb1", "rb2", "wr1", "wr2", "te1")
+        ]
+        analysis = self.analyze(
+            ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF"],
+            players,
+            starters=starters,
+        )
+        team = analysis["teams"]["3"]
+        for position in ("QB", "RB", "WR", "TE"):
+            with self.subTest(position=position):
+                self.assertEqual(team["position_need"][position]["need"], "moderate")
+        self.assertEqual(team["starting_depth"]["QB"]["starting_depth"], "deep")
+        self.assertEqual(team["starting_depth"]["RB"]["starting_depth"], "deep")
+        self.assertEqual(team["starting_depth"]["WR"]["starting_depth"], "adequate")
+        self.assertEqual(team["starting_depth"]["TE"]["starting_depth"], "thin")
+        self.assertEqual(team["starting_depth"]["RB"]["flex_available"], 1)
+
+    def test_no_flex_keeps_direct_requirements_only(self):
+        players = [
+            self.player("qb", "QB"),
+            self.player("rb1", "RB"), self.player("rb2", "RB"),
+            self.player("wr1", "WR"), self.player("wr2", "WR"),
+            self.player("te", "TE"),
+        ]
+        analysis = self.analyze(
+            ["QB", "RB", "RB", "WR", "WR", "TE"],
+            players,
+            starters=[{"player_id": p["player_id"]} for p in players],
+        )
+        team = analysis["teams"]["3"]
+        self.assertEqual(team["starting_depth"]["RB"]["required"], 2)
+        self.assertEqual(team["starting_depth"]["RB"]["flex_available"], 0)
+        self.assertEqual(team["starting_depth"]["WR"]["flex_available"], 0)
+        self.assertEqual(team["position_need"]["RB"]["need"], "moderate")
+
+    def test_two_flex_slots_remain_shared_across_positions(self):
+        players = [
+            self.player("qb", "QB"),
+            self.player("rb1", "RB"), self.player("rb2", "RB"),
+            self.player("rb3", "RB"),
+            self.player("wr1", "WR"), self.player("wr2", "WR"),
+            self.player("wr3", "WR"),
+            self.player("te1", "TE"), self.player("te2", "TE"),
+        ]
+        starters = [
+            {"player_id": player_id}
+            for player_id in ("qb", "rb1", "rb2", "wr1", "wr2", "te1")
+        ]
+        analysis = self.analyze(
+            ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "FLEX"],
+            players,
+            starters=starters,
+        )
+        team = analysis["teams"]["3"]
+        self.assertEqual(team["starting_depth"]["RB"]["required"], 2)
+        self.assertEqual(team["starting_depth"]["WR"]["required"], 2)
+        self.assertEqual(team["starting_depth"]["TE"]["required"], 1)
+        self.assertEqual(analysis["lineup_requirements"]["FLEX"], 2)
+        flex_depth_total = sum(
+            team["starting_depth"][position]["flex_available"]
+            for position in ("QB", "RB", "WR", "TE")
+        )
+        self.assertLessEqual(flex_depth_total, 2)
+
+    def test_wrrb_flex_does_not_create_te_flex_supply(self):
+        analysis = self.analyze(
+            ["WRRB_FLEX"],
+            [self.player("rb", "RB"), self.player("wr", "WR"),
+             self.player("te", "TE")],
+        )
+        team = analysis["teams"]["3"]
+        self.assertEqual(team["starting_depth"]["RB"]["flex_available"], 1)
+        self.assertEqual(team["starting_depth"]["WR"]["flex_available"], 0)
+        self.assertEqual(team["starting_depth"]["TE"]["flex_available"], 0)
+        self.assertEqual(team["starting_depth"]["TE"]["required"], 0)
+
+    def test_rec_flex_does_not_create_rb_flex_supply(self):
+        analysis = self.analyze(
+            ["REC_FLEX"],
+            [self.player("rb", "RB"), self.player("wr", "WR"),
+             self.player("te", "TE")],
+        )
+        team = analysis["teams"]["3"]
+        self.assertEqual(team["starting_depth"]["RB"]["flex_available"], 0)
+        self.assertEqual(team["starting_depth"]["WR"]["flex_available"], 1)
+        self.assertEqual(team["starting_depth"]["TE"]["flex_available"], 0)
+
+    def test_super_flex_can_contribute_to_qb_rb_wr_or_te_depth(self):
+        players = [
+            self.player("qb1", "QB"), self.player("qb2", "QB"),
+            self.player("rb1", "RB"), self.player("rb2", "RB"),
+            self.player("rb3", "RB"),
+            self.player("wr1", "WR"), self.player("wr2", "WR"),
+            self.player("wr3", "WR"), self.player("te", "TE"),
+        ]
+        analysis = self.analyze(
+            ["QB", "RB", "RB", "WR", "WR", "SUPER_FLEX"],
+            players,
+            starters=[
+                {"player_id": p}
+                for p in ("qb1", "rb1", "rb2", "wr1", "wr2")
+            ],
+        )
+        team = analysis["teams"]["3"]
+        assigned_position = team["optimal_lineup"]["SUPER_FLEX"][0]["position"]
+        self.assertIn(assigned_position, {"QB", "RB", "WR", "TE"})
+        self.assertEqual(
+            team["starting_depth"][assigned_position]["flex_available"],
+            1,
+        )
+
+    def test_zero_direct_and_flex_demand_does_not_mark_position_short(self):
+        analysis = self.analyze(["WR"], [self.player("wr", "WR")])
+        team = analysis["teams"]["3"]
+        self.assertEqual(team["starting_depth"]["RB"]["required"], 0)
+        self.assertEqual(team["starting_depth"]["RB"]["starting_depth"], "adequate")
+        self.assertNotEqual(team["position_need"]["RB"]["need"], "high")
+
+    def test_overlapping_player_is_not_counted_for_direct_and_flex_depth(self):
+        analysis = self.analyze(
+            ["RB", "FLEX"],
+            [self.player("rb1", "RB")],
+            starters=[{"player_id": "rb1"}],
+        )
+        team = analysis["teams"]["3"]
+        depth = team["starting_depth"]["RB"]
+        self.assertEqual(depth["required"], 1)
+        self.assertEqual(depth["meaningful_players"], 1)
+        self.assertEqual(depth["flex_available"], 0)
+        self.assertEqual(team["lineup_coverage"]["summary"]["covered_slots"], 1)
+
+    def test_extra_direct_depth_uses_existing_thresholds_scaled_to_slots(self):
+        players = [
+            self.player("rb1", "RB", 10), self.player("rb2", "RB", 20),
+            self.player("rb3", "RB", 60), self.player("rb4", "RB", 180),
+        ]
+        analysis = self.analyze(
+            ["RB", "RB", "RB"],
+            players,
+            starters=[{"player_id": p} for p in ("rb1", "rb2", "rb3")],
+        )
+        depth = analysis["teams"]["3"]["starting_depth"]["RB"]
+        self.assertEqual(depth["required"], 3)
+        self.assertEqual(depth["starting_depth"], "adequate")
+
+    def test_unknown_slots_do_not_create_supported_position_demand(self):
+        analysis = self.analyze(
+            ["CUSTOM_SLOT"], [self.player("rb", "RB")]
+        )
+        team = analysis["teams"]["3"]
+        self.assertEqual(team["starting_depth"]["RB"]["required"], 0)
+        self.assertEqual(team["starting_depth"]["RB"]["starting_depth"], "adequate")
+        self.assertEqual(
+            team["lineup_coverage"]["summary"]["unsupported_slots"],
+            {"CUSTOM_SLOT": 1},
+        )
 
 
 if __name__ == "__main__":
