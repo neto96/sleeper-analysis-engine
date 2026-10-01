@@ -1879,6 +1879,60 @@ def classify_league_scarcity(
 
     return scarcity
 
+def parse_roster_configuration(roster_positions):
+    """Normalize Sleeper roster-position slot codes without side effects."""
+    direct_position_codes = {
+        "QB", "RB", "WR", "TE", "K", "DEF", "DL", "LB", "DB"
+    }
+
+    flex_eligibility = {
+        "FLEX": ["RB", "WR", "TE"],
+        "WRRB_FLEX": ["RB", "WR"],
+        "REC_FLEX": ["WR", "TE"],
+        "SUPER_FLEX": ["QB", "RB", "WR", "TE"],
+        "IDP_FLEX": ["DL", "LB", "DB"],
+    }
+
+    direct_slots = {}
+    flex_slots = {}
+    nonstarter_slots = {}
+    unrecognized_slots = {}
+
+    for raw_slot in roster_positions or []:
+        slot_code = str(raw_slot).strip()
+        normalized_code = slot_code.upper()
+
+        if normalized_code == "BN":
+            nonstarter_slots["BN"] = (
+                nonstarter_slots.get("BN", 0) + 1
+            )
+        elif normalized_code in flex_eligibility:
+            slot = flex_slots.setdefault(
+                normalized_code,
+                {
+                    "count": 0,
+                    "eligible_positions": flex_eligibility[
+                        normalized_code
+                    ],
+                },
+            )
+            slot["count"] += 1
+        elif normalized_code in direct_position_codes:
+            direct_slots[normalized_code] = (
+                direct_slots.get(normalized_code, 0) + 1
+            )
+        else:
+            unrecognized_slots[slot_code] = (
+                unrecognized_slots.get(slot_code, 0) + 1
+            )
+
+    return {
+        "direct_slots": dict(sorted(direct_slots.items())),
+        "flex_slots": dict(sorted(flex_slots.items())),
+        "nonstarter_slots": dict(sorted(nonstarter_slots.items())),
+        "unrecognized_slots": dict(sorted(unrecognized_slots.items())),
+    }
+
 def build_fantasy_analysis(roster_data):
 
     lineup_requirements = {
