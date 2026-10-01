@@ -27,6 +27,53 @@ parse_roster_configuration = load_parser()
 
 
 class RosterConfigurationParserTests(unittest.TestCase):
+    def test_main_parses_and_passes_league_roster_configuration(self):
+        tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
+        main = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+        assignments = [
+            node for node in ast.walk(main)
+            if isinstance(node, ast.Assign)
+        ]
+
+        configuration_assignment = next(
+            node for node in assignments
+            if any(
+                isinstance(target, ast.Name)
+                and target.id == "roster_configuration"
+                for target in node.targets
+            )
+        )
+        parser_call = configuration_assignment.value
+        self.assertIsInstance(parser_call, ast.Call)
+        self.assertIsInstance(parser_call.func, ast.Name)
+        self.assertEqual(parser_call.func.id, "parse_roster_configuration")
+        league_field = parser_call.args[0]
+        self.assertIsInstance(league_field, ast.Call)
+        self.assertIsInstance(league_field.func, ast.Attribute)
+        self.assertEqual(league_field.func.attr, "get")
+        self.assertIsInstance(league_field.func.value, ast.Name)
+        self.assertEqual(league_field.func.value.id, "league")
+        self.assertEqual(ast.literal_eval(league_field.args[0]), "roster_positions")
+
+        analysis_assignment = next(
+            node for node in assignments
+            if isinstance(node.targets[0], ast.Subscript)
+            and isinstance(node.targets[0].value, ast.Name)
+            and node.targets[0].value.id == "snapshot"
+            and isinstance(node.targets[0].slice, ast.Constant)
+            and node.targets[0].slice.value == "fantasy_analysis"
+        )
+        analysis_call = analysis_assignment.value
+        self.assertIsInstance(analysis_call, ast.Call)
+        self.assertIsInstance(analysis_call.func, ast.Name)
+        self.assertEqual(analysis_call.func.id, "build_fantasy_analysis")
+        self.assertEqual(
+            [argument.id for argument in analysis_call.args],
+            ["roster_data", "roster_configuration"],
+        )
     def test_standard_nlfl_configuration(self):
         parsed = parse_roster_configuration([
             "QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF",

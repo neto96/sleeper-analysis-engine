@@ -1933,7 +1933,7 @@ def parse_roster_configuration(roster_positions):
         "unrecognized_slots": dict(sorted(unrecognized_slots.items())),
     }
 
-def build_fantasy_analysis(roster_data):
+def build_fantasy_analysis(roster_data, roster_configuration):
 
     lineup_requirements = {
         "QB": 1,
@@ -1952,6 +1952,7 @@ def build_fantasy_analysis(roster_data):
     }
 
     analysis = {
+        "roster_configuration": roster_configuration,
         "lineup_requirements": lineup_requirements,
         "flex_positions": sorted(flex_positions),
         "teams": {}
@@ -4303,6 +4304,10 @@ def main():
         f"/league/{LEAGUE_ID}"
     )
 
+    roster_configuration = parse_roster_configuration(
+        league.get("roster_positions")
+    )
+
     users_raw = api_get(
         f"/league/{LEAGUE_ID}/users"
     )
@@ -4482,7 +4487,8 @@ def main():
     }
     
     snapshot["fantasy_analysis"] = build_fantasy_analysis(
-        roster_data
+        roster_data,
+        roster_configuration
     )
     snapshot["waiver_analysis"] = build_waiver_analysis(
         waiver_pool,

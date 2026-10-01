@@ -1,6 +1,7 @@
 """Offline characterization tests for V3.2 fantasy analysis."""
 
 import ast
+import json
 import unittest
 from pathlib import Path
 
@@ -14,6 +15,7 @@ FUNCTIONS = {
     "classify_league_scarcity",
     "calculate_optimal_lineup",
     "build_fantasy_analysis",
+    "parse_roster_configuration",
 }
 
 
@@ -47,6 +49,10 @@ def load_analysis_functions():
 
 
 ANALYSIS = load_analysis_functions()
+NLFL_ROSTER_CONFIGURATION = ANALYSIS["parse_roster_configuration"]([
+    "QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF",
+    "BN", "BN", "BN", "BN", "BN", "BN",
+])
 
 
 class V32AnalysisCharacterizationTests(unittest.TestCase):
@@ -91,7 +97,7 @@ class V32AnalysisCharacterizationTests(unittest.TestCase):
                 "taxi": [players[2]],
             }
         }
-        analysis = ANALYSIS["build_fantasy_analysis"](roster)
+        analysis = ANALYSIS["build_fantasy_analysis"](roster, NLFL_ROSTER_CONFIGURATION)
         rb_summary = analysis["teams"]["3"]["position_summary"]["RB"]
 
         # Elite/strong/useful count; fringe and unknown do not. IR, reserve,
@@ -139,8 +145,9 @@ class V32AnalysisCharacterizationTests(unittest.TestCase):
                 "taxi": [],
             }
         }
-        analysis = ANALYSIS["build_fantasy_analysis"](roster)
+        analysis = ANALYSIS["build_fantasy_analysis"](roster, NLFL_ROSTER_CONFIGURATION)
         team = analysis["teams"]["3"]
+        self.assertEqual(analysis["roster_configuration"], NLFL_ROSTER_CONFIGURATION)
         self.assertEqual(analysis["lineup_requirements"], {
             "QB": 1, "RB": 2, "WR": 2, "TE": 1,
             "K": 1, "DEF": 1, "FLEX": 1,
@@ -151,6 +158,11 @@ class V32AnalysisCharacterizationTests(unittest.TestCase):
              in team["optimal_lineup"].items()},
             {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1},
         )
+        self.assertEqual(team["lineup_coverage"]["K"]["required"], 1)
+        self.assertEqual(team["lineup_coverage"]["DEF"]["required"], 1)
+        self.assertEqual(team["lineup_coverage"]["FLEX"]["coverage"], 1)
+        self.assertEqual(team["lineup_coverage"]["FLEX"]["shortage"], 0)
+        json.dumps(analysis)
 
 
 if __name__ == "__main__":
