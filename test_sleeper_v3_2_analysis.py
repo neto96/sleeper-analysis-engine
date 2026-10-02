@@ -17,6 +17,8 @@ FUNCTIONS = {
     "classify_starting_depth",
     "get_position_slot_requirements",
     "calculate_lineup_strength",
+    "calculate_roster_surplus",
+    "calculate_roster_replacement_cost",
     "calculate_optimal_lineup",
     "build_fantasy_analysis",
     "parse_roster_configuration",
@@ -43,8 +45,6 @@ def load_analysis_functions():
         raise RuntimeError(f"Could not find expected functions: {FUNCTIONS - found}")
 
     namespace = {
-        "calculate_roster_surplus": _unused_analysis_stage,
-        "calculate_roster_replacement_cost": _unused_analysis_stage,
         "calculate_player_protection": _unused_analysis_stage,
     }
     isolated_module = ast.Module(body=definitions, type_ignores=[])
@@ -545,6 +545,431 @@ class ConfigurationAwareLineupStrengthTests(unittest.TestCase):
 
         adequate, _ = self.evaluate(slots, strong_players[:2])
         self.assertEqual(adequate["RB"]["rating"], "adequate")
+
+
+class ConfigurationAwareRosterSurplusTests(unittest.TestCase):
+    positions = ("QB", "RB", "WR", "TE", "K", "DEF")
+
+    @staticmethod
+    def player(player_id, position, tier="useful", roster_status="bench"):
+        return {
+            "player_id": player_id,
+            "name": player_id,
+            "position": position,
+            "fantasy_value_tier": tier,
+            "roster_status": roster_status,
+        }
+
+    def analyze(self, roster_slots, players):
+        configuration = ANALYSIS["parse_roster_configuration"](roster_slots)
+        positions = {position: [] for position in self.positions}
+        for player in players:
+            positions[player["position"]].append(player)
+        team = {
+            "positions": positions,
+            "optimal_lineup": ANALYSIS["calculate_optimal_lineup"](
+                positions, configuration
+            ),
+        }
+        return (
+            ANALYSIS["calculate_roster_surplus"](team, configuration),
+            team,
+        )
+
+    @staticmethod
+    def surplus_ids(surplus):
+        return {
+            str(player["player_id"])
+            for player in surplus
+            if player["surplus_type"] in {"surplus", "replaceable"}
+        }
+
+    def test_nlfl_configuration_has_one_unique_meaningful_surplus_player(self):
+        surplus, _ = self.analyze(
+            ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF"],
+            [self.player("qb", "QB"),
+             self.player("rb1", "RB"), self.player("rb2", "RB"),
+             self.player("rb3", "RB"),
+             self.player("wr1", "WR"), self.player("wr2", "WR"),
+             self.player("wr3", "WR"), self.player("te", "TE")],
+        )
+        self.assertEqual(len(self.surplus_ids(surplus)), 1)
+        self.assertEqual(len(surplus), 8)
+
+    def test_no_flex_uses_only_direct_configured_slots(self):
+        surplus, _ = self.analyze(
+            ["RB", "RB"],
+            [self.player(f"rb{i}", "RB") for i in range(1, 5)],
+        )
+        self.assertEqual(self.surplus_ids(surplus), {"rb3", "rb4"})
+
+    def test_direct_rb2_with_four_rbs_has_two_surplus(self):
+        surplus, _ = self.analyze(
+            ["RB", "RB"],
+            [self.player(f"rb{i}", "RB") for i in range(1, 5)],
+        )
+        self.assertEqual(len(self.surplus_ids(surplus)), 2)
+
+    def test_exact_fit_roster_has_no_surplus(self):
+        surplus, _ = self.analyze(
+            ["RB", "RB", "FLEX"],
+            [self.player("rb1", "RB"), self.player("rb2", "RB"),
+             self.player("wr1", "WR")],
+        )
+        self.assertEqual(self.surplus_ids(surplus), set())
+
+    def test_overlapping_rb_and_flex_supply_has_only_one_surplus(self):
+        surplus, team = self.analyze(
+            ["RB", "RB", "FLEX"],
+            [self.player("rb1", "RB"), self.player("rb2", "RB"),
+             self.player("rb3", "RB"), self.player("wr1", "WR")],
+        )
+        self.assertEqual(len(self.surplus_ids(surplus)), 1)
+        assignments = [
+            player for players in team["optimal_lineup"].values()
+            for player in players
+        ]
+        self.assertEqual(
+            len({player["player_id"] for player in assignments}),
+            len(assignments),
+        )
+
+    def test_exact_three_players_for_rb2_and_flex_has_no_surplus(self):
+        surplus, _ = self.analyze(
+            ["RB", "RB", "FLEX"],
+            [self.player("rb1", "RB"), self.player("rb2", "RB"),
+             self.player("wr1", "WR")],
+        )
+        self.assertEqual(self.surplus_ids(surplus), set())
+
+    def test_wrrb_flex_does_not_consume_te_supply(self):
+        surplus, team = self.analyze(
+            ["RB", "TE", "WRRB_FLEX"],
+            [self.player("rb1", "RB"), self.player("wr1", "WR"),
+             self.player("te1", "TE"), self.player("te2", "TE")],
+        )
+        assigned_flex = team["optimal_lineup"]["WRRB_FLEX"]
+        self.assertEqual(len(assigned_flex), 1)
+        self.assertIn(assigned_flex[0]["position"], {"RB", "WR"})
+        te_rows = [player for player in surplus if player["position"] == "TE"]
+        self.assertEqual(len(te_rows), 2)
+        self.assertEqual(self.surplus_ids(te_rows), {"te2"})
+
+    def test_rec_flex_does_not_consume_rb_supply(self):
+        surplus, team = self.analyze(
+            ["RB", "TE", "REC_FLEX"],
+            [self.player("rb1", "RB"), self.player("rb2", "RB"),
+             self.player("te1", "TE"), self.player("wr1", "WR")],
+        )
+        assigned_flex = team["optimal_lineup"]["REC_FLEX"]
+        self.assertEqual(len(assigned_flex), 1)
+        self.assertIn(assigned_flex[0]["position"], {"WR", "TE"})
+        self.assertEqual(self.surplus_ids(surplus), {"rb2"})
+
+    def test_super_flex_capacity_is_one_shared_slot(self):
+        surplus, team = self.analyze(
+            ["SUPER_FLEX"],
+            [self.player("qb", "QB"), self.player("rb", "RB"),
+             self.player("wr", "WR"), self.player("te", "TE")],
+        )
+        assigned = team["optimal_lineup"]["SUPER_FLEX"]
+        self.assertEqual(len(assigned), 1)
+        self.assertEqual(len(self.surplus_ids(surplus)), 3)
+        all_ids = [player["player_id"] for player in assigned]
+        self.assertEqual(len(all_ids), len(set(all_ids)))
+
+    def test_multiple_flex_slots_create_distinct_shared_capacity(self):
+        surplus, team = self.analyze(
+            ["FLEX", "FLEX"],
+            [self.player("rb1", "RB"), self.player("rb2", "RB"),
+             self.player("wr1", "WR"), self.player("te1", "TE")],
+        )
+        self.assertEqual(len(team["optimal_lineup"]["FLEX"]), 2)
+        self.assertEqual(len(self.surplus_ids(surplus)), 2)
+
+    def test_mixed_flex_types_share_unique_player_supply(self):
+        surplus, team = self.analyze(
+            ["WRRB_FLEX", "SUPER_FLEX"],
+            [self.player("qb", "QB"), self.player("rb", "RB"),
+             self.player("wr", "WR"), self.player("te", "TE")],
+        )
+        assignments = [
+            player for players in team["optimal_lineup"].values()
+            for player in players
+        ]
+        self.assertEqual(len(assignments), 2)
+        self.assertEqual(
+            len({player["player_id"] for player in assignments}), 2
+        )
+        self.assertEqual(len(self.surplus_ids(surplus)), 2)
+
+    def test_meaningful_player_population_is_unchanged(self):
+        surplus, _ = self.analyze(
+            ["RB"],
+            [self.player("elite", "RB", "elite"),
+             self.player("strong", "RB", "strong"),
+             self.player("useful", "RB", "useful"),
+             self.player("fringe", "RB", "fringe"),
+             self.player("deep", "RB", "deep_waiver")],
+        )
+        self.assertEqual(
+            {player["player_id"] for player in surplus},
+            {"elite", "strong", "useful"},
+        )
+        self.assertEqual(len(self.surplus_ids(surplus)), 2)
+
+    def test_duplicate_player_ids_produce_one_surplus_record(self):
+        surplus, _ = self.analyze(
+            ["FLEX"],
+            [self.player("shared", "RB"), self.player("shared", "WR"),
+             self.player("wr2", "WR")],
+        )
+        player_ids = [player["player_id"] for player in surplus]
+        self.assertEqual(len(player_ids), len(set(player_ids)))
+        self.assertEqual(len(self.surplus_ids(surplus)), 1)
+
+
+class ConfigurationAwareReplacementCostTests(unittest.TestCase):
+    positions = ("QB", "RB", "WR", "TE", "K", "DEF")
+
+    @staticmethod
+    def player(player_id, position, tier="useful", importance=0):
+        return {
+            "player_id": player_id,
+            "name": player_id,
+            "position": position,
+            "fantasy_value_tier": tier,
+            "importance_score": importance,
+        }
+
+    def analyze(self, roster_slots, players):
+        configuration = ANALYSIS["parse_roster_configuration"](roster_slots)
+        positions = {position: [] for position in self.positions}
+        for player in players:
+            positions[player["position"]].append(player)
+        optimizer_lineup = ANALYSIS["calculate_optimal_lineup"](
+            positions, configuration
+        )
+        results = ANALYSIS["calculate_roster_replacement_cost"](
+            {"positions": positions, "optimal_lineup": optimizer_lineup},
+            configuration,
+        )
+        return configuration, optimizer_lineup, results
+
+    @staticmethod
+    def result_for(results, player_id):
+        return next(result for result in results if result["player_id"] == player_id)
+
+    def test_no_flex_direct_only_replacement_scores(self):
+        _, lineup, results = self.analyze(
+            ["RB"],
+            [self.player("starter", "RB", "elite"),
+             self.player("bench", "RB", "useful")],
+        )
+        result = self.result_for(results, "starter")
+        self.assertEqual([p["player_id"] for p in lineup["RB"]], ["starter"])
+        self.assertEqual(result["lineup_score_before"], 500)
+        self.assertEqual(result["lineup_score_after"], 300)
+        self.assertEqual(result["score_difference"], 200)
+        self.assertEqual(result["replacement_cost"], "high")
+        self.assertEqual(result["replacement_player_id"], "bench")
+
+    def test_unique_direct_player_has_positive_replacement_cost(self):
+        _, _, results = self.analyze(
+            ["QB"], [self.player("only-qb", "QB", "elite")]
+        )
+        result = self.result_for(results, "only-qb")
+        self.assertGreater(result["score_difference"], 0)
+        self.assertEqual(result["replacement_cost"], "very_high")
+        self.assertIsNone(result["replacement_player_id"])
+
+    def test_near_equivalent_direct_depth_has_smaller_replacement_cost(self):
+        _, _, results = self.analyze(
+            ["RB"],
+            [self.player("starter", "RB", "strong"),
+             self.player("replacement", "RB", "useful")],
+        )
+        result = self.result_for(results, "starter")
+        self.assertEqual(result["score_difference"], 100)
+        self.assertEqual(result["replacement_cost"], "moderate")
+
+    def test_flex_overlap_is_evaluated_by_global_optimizer(self):
+        _, lineup, results = self.analyze(
+            ["RB", "FLEX"],
+            [self.player("rb-elite", "RB", "elite"),
+             self.player("rb-useful", "RB", "useful"),
+             self.player("wr-strong", "WR", "strong")],
+        )
+        lineup_ids = [
+            player["player_id"]
+            for players in lineup.values()
+            for player in players
+        ]
+        self.assertEqual(len(lineup_ids), len(set(lineup_ids)))
+        result = self.result_for(results, "rb-elite")
+        self.assertEqual(result["lineup_score_before"], 900)
+        self.assertEqual(result["lineup_score_after"], 700)
+        self.assertEqual(result["score_difference"], 200)
+
+    def test_flex_only_dependency_has_positive_cost(self):
+        _, lineup, results = self.analyze(
+            ["FLEX"],
+            [self.player("te-only", "TE", "useful"),
+             self.player("qb-ineligible", "QB", "elite")],
+        )
+        result = self.result_for(results, "te-only")
+        self.assertEqual([p["player_id"] for p in lineup["FLEX"]], ["te-only"])
+        self.assertEqual(result["score_difference"], 300)
+        self.assertEqual(result["replacement_cost"], "very_high")
+
+    def test_bench_player_can_have_zero_replacement_cost(self):
+        _, _, results = self.analyze(
+            ["RB"],
+            [self.player("starter", "RB", "elite"),
+             self.player("bench", "RB", "useful")],
+        )
+        result = self.result_for(results, "bench")
+        self.assertIsNone(result["lineup_position"])
+        self.assertEqual(result["score_difference"], 0)
+        self.assertEqual(result["replacement_cost"], "low")
+        self.assertIsNone(result["replacement_player_id"])
+
+    def test_multiple_flex_slots_use_total_configured_structure(self):
+        _, lineup, results = self.analyze(
+            ["FLEX", "FLEX"],
+            [self.player("rb", "RB", "elite"),
+             self.player("wr", "WR", "strong"),
+             self.player("te", "TE", "useful")],
+        )
+        self.assertEqual(len(lineup["FLEX"]), 2)
+        result = self.result_for(results, "rb")
+        self.assertEqual(result["lineup_score_before"], 900)
+        self.assertEqual(result["lineup_score_after"], 700)
+        ids = [
+            player["player_id"]
+            for players in lineup.values()
+            for player in players
+        ]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_wrrb_flex_replacement_excludes_te(self):
+        _, lineup, results = self.analyze(
+            ["WRRB_FLEX"],
+            [self.player("rb", "RB", "useful"),
+             self.player("wr", "WR", "fringe"),
+             self.player("te", "TE", "elite")],
+        )
+        self.assertEqual([p["player_id"] for p in lineup["WRRB_FLEX"]], ["rb"])
+        result = self.result_for(results, "rb")
+        self.assertEqual(result["replacement_player_id"], "wr")
+        self.assertEqual(result["score_difference"], 100)
+
+    def test_rec_flex_does_not_use_rb_as_replacement(self):
+        _, lineup, results = self.analyze(
+            ["WR", "REC_FLEX"],
+            [self.player("wr", "WR", "elite"),
+             self.player("rb", "RB", "strong")],
+        )
+        result = self.result_for(results, "wr")
+        self.assertEqual([p["player_id"] for p in lineup["WR"]], ["wr"])
+        self.assertEqual(lineup["REC_FLEX"], [])
+        self.assertEqual(result["score_difference"], 500)
+        self.assertIsNone(result["replacement_player_id"])
+
+    def test_super_flex_reoptimizes_across_qb_rb_wr_te(self):
+        _, lineup, results = self.analyze(
+            ["SUPER_FLEX"],
+            [self.player("qb", "QB", "elite"),
+             self.player("rb", "RB", "useful"),
+             self.player("wr", "WR", "strong"),
+             self.player("te", "TE", "fringe")],
+        )
+        self.assertEqual([p["player_id"] for p in lineup["SUPER_FLEX"]], ["qb"])
+        result = self.result_for(results, "qb")
+        self.assertEqual(result["replacement_player_id"], "wr")
+        self.assertEqual(result["score_difference"], 100)
+
+    def test_mixed_flex_types_respect_both_eligibility_sets(self):
+        _, lineup, results = self.analyze(
+            ["WRRB_FLEX", "REC_FLEX"],
+            [self.player("rb", "RB", "elite"),
+             self.player("wr", "WR", "strong"),
+             self.player("te", "TE", "useful")],
+        )
+        self.assertEqual([p["player_id"] for p in lineup["WRRB_FLEX"]], ["rb"])
+        self.assertEqual([p["player_id"] for p in lineup["REC_FLEX"]], ["wr"])
+        result = self.result_for(results, "rb")
+        self.assertEqual(result["replacement_player_id"], "te")
+        self.assertEqual(result["replacement_lineup_position"], "REC_FLEX")
+        self.assertEqual(result["score_difference"], 200)
+
+    def test_baseline_score_agrees_with_optimizer_and_unique_assignment(self):
+        _, lineup, results = self.analyze(
+            ["RB", "WR", "FLEX", "REC_FLEX"],
+            [self.player("rb1", "RB", "elite"),
+             self.player("rb2", "RB", "useful"),
+             self.player("wr1", "WR", "strong"),
+             self.player("wr2", "WR", "useful"),
+             self.player("te", "TE", "fringe")],
+        )
+        expected_score = sum(
+            {"elite": 500, "strong": 400, "useful": 300, "fringe": 200}[
+                player["fantasy_value_tier"]
+            ]
+            + player["importance_score"]
+            for players in lineup.values()
+            for player in players
+        )
+        self.assertTrue(results)
+        self.assertTrue(all(
+            result["lineup_score_before"] == expected_score
+            for result in results
+        ))
+        lineup_ids = [
+            player["player_id"]
+            for players in lineup.values()
+            for player in players
+        ]
+        self.assertEqual(len(lineup_ids), len(set(lineup_ids)))
+
+    def test_nlfl_baseline_uses_standard_configured_slots(self):
+        config, lineup, results = self.analyze(
+            ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF"],
+            [self.player("qb", "QB", "elite"),
+             self.player("rb1", "RB", "elite"),
+             self.player("rb2", "RB", "strong"),
+             self.player("rb3", "RB", "useful"),
+             self.player("wr1", "WR", "elite"),
+             self.player("wr2", "WR", "strong"),
+             self.player("wr3", "WR", "useful"),
+             self.player("te", "TE", "strong"),
+             self.player("k", "K", "elite"),
+             self.player("def", "DEF", "elite")],
+        )
+        self.assertEqual(len(lineup["QB"]), 1)
+        self.assertEqual(len(lineup["RB"]), 2)
+        self.assertEqual(len(lineup["WR"]), 2)
+        self.assertEqual(len(lineup["TE"]), 1)
+        self.assertEqual(len(lineup["FLEX"]), 1)
+        self.assertEqual(len(results), 8)
+        self.assertTrue(all(result["replacement_cost"] for result in results))
+
+    def test_non_meaningful_optimizer_player_remains_in_analysis(self):
+        _, lineup, results = self.analyze(
+            ["TE"], [self.player("fringe-te", "TE", "fringe")]
+        )
+        self.assertEqual([p["player_id"] for p in lineup["TE"]], ["fringe-te"])
+        result = self.result_for(results, "fringe-te")
+        self.assertEqual(result["score_difference"], 200)
+
+    def test_k_and_def_remain_outside_replacement_cost_scope(self):
+        _, _, results = self.analyze(
+            ["K", "DEF", "RB"],
+            [self.player("k", "K", "elite"),
+             self.player("def", "DEF", "elite"),
+             self.player("rb", "RB", "elite")],
+        )
+        self.assertEqual([result["player_id"] for result in results], ["rb"])
 
 
 class ConfigurationAwareLineupCoverageTests(unittest.TestCase):

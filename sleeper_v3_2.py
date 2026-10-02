@@ -1169,7 +1169,8 @@ def calculate_lineup_strength(
 
     return strength
 def calculate_roster_surplus(
-    team
+    team,
+    roster_configuration,
     ):
 
     surplus = []
@@ -1185,26 +1186,59 @@ def calculate_roster_surplus(
     )
 
     lineup_ids = set()
-
     for position_players in optimal_lineup.values():
-
         for player in position_players:
+            lineup_ids.add(player.get("player_id"))
 
-            lineup_ids.add(
-                player.get(
-                    "player_id"
-                )
-            )
-
+    meaningful_tiers = {"elite", "strong", "useful"}
     tier_score = {
         "elite": 5,
         "strong": 4,
         "useful": 3,
         "fringe": 2,
         "deep_waiver": 1,
-        "unknown": 0
+        "unknown": 0,
+    }
+    offensive_positions = {"QB", "RB", "WR", "TE"}
+    meaningful_positions = {}
+    for position in offensive_positions:
+        meaningful_players = [
+            (index, player)
+            for index, player in enumerate(positions.get(position, []))
+            if player.get("fantasy_value_tier") in meaningful_tiers
+        ]
+        meaningful_players.sort(
+            key=lambda indexed_player: (
+                indexed_player[1].get("player_id") not in lineup_ids,
+                -tier_score.get(
+                    indexed_player[1].get("fantasy_value_tier"),
+                    0,
+                ),
+                indexed_player[0],
+            )
+        )
+        meaningful_positions[position] = [
+            player for _, player in meaningful_players
+        ]
+
+    offensive_slots = [
+        slot
+        for slot in expand_roster_slots(roster_configuration)
+        if slot["slot_type"] in {"direct", "flex"}
+        and slot["supported_by_analyzer"]
+        and set(slot["eligible_positions"]) & offensive_positions
+    ]
+    coverage = assign_roster_slot_coverage(
+        offensive_slots,
+        meaningful_positions,
+    )
+    needed_player_ids = {
+        str(assignment["player_id"])
+        for assignment in coverage["assignments"]
+        if assignment.get("player_id") is not None
     }
 
+    reported_player_ids = set()
     for position in [
         "QB",
         "RB",
@@ -1212,38 +1246,19 @@ def calculate_roster_surplus(
         "TE"
     ]:
 
-        players = positions.get(
-            position,
-            []
-        )
-
-        required = {
-            "QB": 1,
-            "RB": 2,
-            "WR": 2,
-            "TE": 1
-        }.get(
-            position,
-            0
-        )
-
-        meaningful_players = [
-            player
-            for player in players
-            if player.get(
-                "fantasy_value_tier"
-            ) in [
-                "elite",
-                "strong",
-                "useful"
-            ]
-        ]
+        meaningful_players = meaningful_positions[position]
 
         for player in meaningful_players:
 
             player_id = player.get(
                 "player_id"
             )
+
+            if player_id is not None:
+                player_key = str(player_id)
+                if player_key in reported_player_ids:
+                    continue
+                reported_player_ids.add(player_key)
 
             tier = player.get(
                 "fantasy_value_tier"
@@ -1254,55 +1269,16 @@ def calculate_roster_surplus(
                 in lineup_ids
             )
 
-            if position == "QB":
-
-                if len(meaningful_players) > required:
-                    surplus_type = "replaceable"
-                else:
-                    surplus_type = "needed"
-
-            elif position == "TE":
-
-                if len(meaningful_players) > required:
-                    surplus_type = "replaceable"
-                else:
-                    surplus_type = "needed"
-
+            is_needed_for_slots = (
+                player_id is not None
+                and str(player_id) in needed_player_ids
+            )
+            if is_needed_for_slots:
+                surplus_type = "needed"
+            elif position in {"QB", "TE"}:
+                surplus_type = "replaceable"
             else:
-
-                players_above = [
-                    p
-                    for p in meaningful_players
-                    if tier_score.get(
-                        p.get(
-                            "fantasy_value_tier"
-                        ),
-                        0
-                    ) > tier_score.get(
-                        tier,
-                        0
-                    )
-                ]
-
-                if (
-                    not in_lineup
-                    and len(meaningful_players)
-                    > required
-                ):
-
-                    surplus_type = "surplus"
-
-                elif (
-                    not in_lineup
-                    and len(players_above)
-                    >= required
-                ):
-
-                    surplus_type = "surplus"
-
-                else:
-
-                    surplus_type = "needed"
+                surplus_type = "surplus"
 
             if (
                 player.get(
@@ -1348,11 +1324,6 @@ def calculate_roster_replacement_cost(
         {}
     )
 
-    optimal_lineup = team.get(
-        "optimal_lineup",
-        {}
-    )
-
     tier_score = {
         "elite": 5,
         "strong": 4,
@@ -1389,31 +1360,34 @@ def calculate_roster_replacement_cost(
 
         return total
 
-    original_score = lineup_score(
-        optimal_lineup
+    baseline_lineup = calculate_optimal_lineup(
+        positions,
+        roster_configuration,
     )
+    original_score = lineup_score(baseline_lineup)
+    baseline_assignments = {}
 
-    lineup_players = {}
-
-    for lineup_position, players in optimal_lineup.items():
+    for lineup_position, players in baseline_lineup.items():
         for player in players:
-            player_id = player.get(
-                "player_id"
-            )
-
-            if player_id:
-                lineup_players[player_id] = {
-                    "lineup_position":
-                        lineup_position,
-                    "player": player
+            player_id = player.get("player_id")
+            if player_id is not None:
+                baseline_assignments[player_id] = {
+                    "lineup_position": lineup_position,
+                    "player": player,
                 }
 
-    for player_id, lineup_data in lineup_players.items():
+    relevant_players = {}
+    for position in ("QB", "RB", "WR", "TE"):
+        for player in positions.get(position, []):
+            player_id = player.get("player_id")
+            if player_id is not None:
+                relevant_players.setdefault(player_id, player)
 
-        player = lineup_data["player"]
-        lineup_position = lineup_data[
-            "lineup_position"
-        ]
+    baseline_ids = set(baseline_assignments)
+
+    for player_id, player in relevant_players.items():
+        lineup_data = baseline_assignments.get(player_id, {})
+        lineup_position = lineup_data.get("lineup_position")
 
         modified_positions = {
             position: [
@@ -1428,7 +1402,7 @@ def calculate_roster_replacement_cost(
 
         rebuilt_lineup = calculate_optimal_lineup(
             modified_positions,
-            roster_configuration
+            roster_configuration,
         )
 
         rebuilt_score = lineup_score(
@@ -1440,21 +1414,13 @@ def calculate_roster_replacement_cost(
             - rebuilt_score
         )
 
-        original_ids = {
-            p.get("player_id")
-            for players in optimal_lineup.values()
-            for p in players
-        }
-
         rebuilt_ids = {
             p.get("player_id")
             for players in rebuilt_lineup.values()
             for p in players
         }
 
-        replacement_ids = (
-            rebuilt_ids - original_ids
-        )
+        replacement_ids = rebuilt_ids - baseline_ids
 
         replacement_player = None
         replacement_player_id = None
@@ -1551,11 +1517,8 @@ def calculate_roster_replacement_cost(
                         )
                         break
 
-        if replacement_player is None:
-            replacement_cost_level = (
-                "very_high"
-            )
-
+        if replacement_player is None and score_difference > 0:
+            replacement_cost_level = "very_high"
         elif score_difference >= 200:
             replacement_cost_level = "high"
 
@@ -2655,10 +2618,9 @@ def build_fantasy_analysis(roster_data, roster_configuration):
             team,
             roster_configuration,
         )
-        team["roster_surplus"] = (
-            calculate_roster_surplus(
-                team
-            )
+        team["roster_surplus"] = calculate_roster_surplus(
+            team,
+            roster_configuration,
         )
         team["roster_replacement_cost"] = (
             calculate_roster_replacement_cost(
