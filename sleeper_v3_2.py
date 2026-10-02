@@ -678,6 +678,11 @@ def classify_position_need(
             meaningful_difference
     }
 def calculate_optimal_lineup(positions, roster_configuration):
+    """Find the highest-scoring legal QB/RB/WR/TE lineup for configured slots.
+
+    K, DEF, and IDP slots remain outside this offensive optimizer. Slot
+    eligibility and counts come from the shared normalized slot expansion.
+    """
     supported_positions = ["QB", "RB", "WR", "TE"]
 
     tier_score = {
@@ -1172,6 +1177,11 @@ def calculate_roster_surplus(
     team,
     roster_configuration,
     ):
+    """Classify meaningful offensive players against unique configured slots.
+
+    Meaningful-player tiers retain their existing definition; the shared
+    coverage assignment prevents one player satisfying multiple slots.
+    """
 
     surplus = []
 
@@ -1317,6 +1327,11 @@ def calculate_roster_replacement_cost(
     team,
     roster_configuration
     ):
+    """Measure lineup-score loss by removing each offensive roster player.
+
+    Both baseline and removal scores use the configured optimal-lineup
+    optimizer; K/DEF remain outside its player-selection scope.
+    """
     replacement_cost = []
 
     positions = team.get(
@@ -1988,7 +2003,11 @@ def classify_league_scarcity(
     return scarcity
 
 def parse_roster_configuration(roster_positions):
-    """Normalize Sleeper roster-position slot codes without side effects."""
+    """Normalize raw Sleeper slots into direct, FLEX, bench, and unknown counts.
+
+    FLEX eligibility is recorded here; downstream code interprets the
+    normalized data through the shared slot helpers.
+    """
     direct_position_codes = {
         "QB", "RB", "WR", "TE", "K", "DEF", "DL", "LB", "DB"
     }
@@ -2043,7 +2062,7 @@ def parse_roster_configuration(roster_positions):
 
 
 def get_slot_eligible_positions(slot_code, roster_configuration):
-    """Return the configured player positions eligible for one slot code."""
+    """Return positions eligible for a slot from normalized configuration."""
     normalized_code = str(slot_code).strip().upper()
     configuration = roster_configuration or {}
 
@@ -2058,7 +2077,11 @@ def get_slot_eligible_positions(slot_code, roster_configuration):
 
 
 def expand_roster_slots(roster_configuration):
-    """Expand normalized roster counts into deterministic slot instances."""
+    """Expand normalized counts into ordered, annotated slot instances.
+
+    Bench slots are non-starters; unknown and analyzer-unsupported slots are
+    retained with metadata instead of being treated as supported positions.
+    """
     configuration = roster_configuration or {}
     direct_slots = configuration.get("direct_slots", {})
     flex_slots = configuration.get("flex_slots", {})
@@ -2143,7 +2166,11 @@ def expand_roster_slots(roster_configuration):
 
 
 def assign_roster_slot_coverage(slot_instances, positions):
-    """Assign unique roster players to the maximum number of supported slots."""
+    """Assign unique players to the maximum number of supported slots.
+
+    FLEX coverage retains its existing meaningful/available-player filter;
+    K/DEF direct slots are supported here, while IDP slots are not.
+    """
     supported_positions = {"QB", "RB", "WR", "TE", "K", "DEF"}
     meaningful_tiers = {"elite", "strong", "useful"}
     supported_slots = []
@@ -2280,6 +2307,7 @@ def assign_roster_slot_coverage(slot_instances, positions):
 
 
 def build_fantasy_analysis(roster_data, roster_configuration):
+    """Build team analysis using one normalized league roster configuration."""
     configured_slots = expand_roster_slots(roster_configuration)
     direct_positions = ["QB", "RB", "WR", "TE", "K", "DEF"]
     lineup_requirements = {
@@ -2746,6 +2774,10 @@ def build_waiver_analysis(
     waiver_pool,
     fantasy_analysis
     ):
+    """Rank offensive waiver candidates using configuration-aware need/scarcity.
+
+    The established waiver model intentionally covers QB/RB/WR/TE only.
+    """
     my_team = fantasy_analysis[
         "teams"
     ].get(
